@@ -69,7 +69,6 @@ async def process_mine_click(callback: CallbackQuery):
     is_boom = False
     is_win = False
 
-    # Siz bergan taktika shartlari:
     if game_num == 1:
         if step > 3:
             is_boom = True
@@ -160,7 +159,7 @@ async def get_card_number() -> str:
     return row[0] if row else "Kiritilmagan"
 
 async def set_card_number(card: str):
-    await asyncio.to_thread(db_query, "UPDATE settings SET value = ? WHERE key = 'card_number'", (card,), commit=True)
+    await asyncio.to_thread(db_query, "INSERT OR REPLACE INTO settings (key, value) VALUES ('card_number', ?)", (card,), commit=True)
 
 async def get_balance(user_id: int) -> int:
     row = await asyncio.to_thread(db_query, "SELECT balance FROM users WHERE user_id = ?", (user_id,), fetchone=True)

@@ -1,4 +1,4 @@
-import asyncio
+import asyncio                                        
 import logging
 import os
 import sqlite3
@@ -15,10 +15,85 @@ DB_NAME = "crash_bot.db"
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
-
+# Mines o'yinining statistikasini saqlash uchun
+user_game_steps = {}
+user_total_games = {}
 TARGET_CRASH_X = 2.00
 ACTIVE_GAMES = {}
+def get_mines_keyboard():
+    keyboard = []
+    for r in range(3):
+        row = []
+        for c in range(3):
+            row.append(InlineKeyboardButton(text="❓", callback_data=f"mine_{r}_{c}"))
+        keyboard.append(row)
+    return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
+@dp.message(Command("mines"))
+async def start_mines(message: Message):
+    user_id = message.from_user.id
+    
+    if user_id not in user_total_games:
+        user_total_games[user_id] = 1
+    else:
+        user_total_games[user_id] += 1
+        
+    if user_total_games[user_id] > 9:
+        user_total_games[user_id] = 1
+        
+    user_game_steps[user_id] = 0
+    game_num = user_total_games[user_id]
+    
+    await message.answer(
+        f"💣 **Mines o'yini boshlandi!** (O'yin #{game_num})\n\nKataklardan birini tanlang:",
+        reply_markup=get_mines_keyboard(),
+        parse_mode=ParseMode.MARKDOWN
+    )
+    @dp.callback_query(F.data.startswith("mine_"))
+async def process_mine_click(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    
+    if user_id not in user_game_steps:
+        user_game_steps[user_id] = 0
+    if user_id not in user_total_games:
+        user_total_games[user_id] = 1
+
+    game_num = user_total_games[user_id]
+    step = user_game_steps[user_id] + 1
+    user_game_steps[user_id] = step
+
+    is_boom = False
+    is_win = False
+
+    # Siz bergan taktika shartlari:
+    if game_num == 1:
+        if step > 3:
+            is_boom = True
+    elif game_num in [2, 3, 4]:
+        is_boom = True
+    elif game_num == 5:
+        if step > 3:
+            is_boom = True
+    elif game_num in [6, 7]:
+        is_boom = True
+    elif game_num in [8, 9]:
+        if step >= 3:
+            is_win = True
+
+    if is_win:
+        await callback.message.edit_text(
+            "🎉 **Tabriklaymiz! Siz 3 ta qadamni muvaffaqiyatli bosib o'tdingiz va yutdingiz!** 🏆\n\nQaytadan o'ynash uchun /mines ni bosing.",
+            reply_markup=None,
+            parse_mode=ParseMode.MARKDOWN
+        )
+    elif is_boom:
+        await callback.message.edit_text(
+            f"💥 **Boom! Qadam #{step}. Minaga bosib yutqazdingiz!** 😢\n\nQaytadan o'ynash uchun /mines ni bosing.",
+            reply_markup=None,
+            parse_mode=ParseMode.MARKDOWN
+        )
+    else:
+        await callback.answer(f"✅ Qadam #{step}: Xavfsiz katak! Davom eting.", show_alert=False)
 
 # =========================================================
 # MA'LUMOTLAR BAZASI FUNKSIYALARI

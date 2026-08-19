@@ -1,53 +1,59 @@
 import asyncio                                        
 import logging
-import os
 import sqlite3
 import time
 from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ParseMode
-from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 TOKEN = "8925068569:AAF0Rc5EgaUzBFLvwieF_IBnqQcmAC7n7aQ"
-ADMIN_ID = 8252674515  # Admin Telegram ID SI
+ADMIN_ID = 8252674515  
 DB_NAME = "crash_bot.db"
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
-# Mines o'yini uchun o'zgaruvchilar va koeffitsiyentlar (X)
+# Mines o'yini uchun ma'lumotlar saqlagichlar
 user_game_steps = {}
 user_total_games = {}
 user_mines_bets = {}
 
-TARGET_CRASH_X = 2.00
-ACTIVE_GAMES = {}
-
-# Mines yutuq koeffitsiyentlari (har bir bosqich uchun X)
+# Mines yutuq koeffitsiyentlari (Har bir bosqich uchun X)
 MINES_MULTIPLIERS = {
     1: 1.20,
     2: 1.50,
-    3: 2.00
+    3: 2.00,
+    4: 2.80,
+    5: 4.00,
+    6: 6.00
 }
 
-def get_mines_keyboard():
+def get_mines_keyboard(step: int, current_x: float, bet: int):
     keyboard = []
+    # 3x3 Mines kataklari
     for r in range(3):
         row = []
         for c in range(3):
-            row.append(InlineKeyboardButton(text="❓", callback_data=f"mine_{r}_{c}"))
+            row.append(InlineKeyboardButton(text="💣", callback_data=f"mine_{r}_{c}"))
         keyboard.append(row)
     
-    # Pulni yechib olish tugmasi (Cash Out)
-    keyboard.append([InlineKeyboardButton(text="💰 Pulni yechib olish (Cash Out)", callback_data="mines_cashout")])
+    # Hozirgi yutuq summasini hisoblash
+    current_win = int(bet * current_x) if step > 0 else 0
+    
+    # Pulni yechib olish va to'xtatish tugmalari
+    if step > 0:
+        keyboard.append([InlineKeyboardButton(text=f"💰 Olish (Cash Out): {money(current_win)} ({current_x:.2f}x)", callback_data="mines_cashout")])
+    else:
+        keyboard.append([InlineKeyboardButton(text="🎯 Katakni tanlang...", callback_data="none")])
+        
     keyboard.append([InlineKeyboardButton(text="❌ O'yinni to'xtatish", callback_data="back_to_menu")])
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
 
 # =========================================================
-# MA'LUMOTLAR BAZASI FUNKSIYALARI
+# MA'LUMOTLAR BAZASI
 # =========================================================
 def db_query(query: str, params: tuple = (), fetchone: bool = False, fetchall: bool = False, commit: bool = False):
     conn = sqlite3.connect(DB_NAME)
@@ -123,9 +129,7 @@ async def change_balance(user_id: int, amount: int):
 
 async def check_user_deposited(user_id: int) -> bool:
     row = await asyncio.to_thread(db_query, "SELECT has_deposited FROM users WHERE user_id = ?", (user_id,), fetchone=True)
-    if row and row[0] == 1:
-        return True
-    return False
+    return row and row[0] == 1
 
 async def set_user_deposited(user_id: int):
     await asyncio.to_thread(db_query, "UPDATE users SET has_deposited = 1 WHERE user_id = ?", (user_id,), commit=True)
@@ -148,15 +152,8 @@ def money(val: int) -> str:
 # =========================================================
 # FSM HOLATLARI
 # =========================================================
-class CrashState(StatesGroup):
-    waiting_bet = State()
-
 class MinesState(StatesGroup):
     waiting_bet = State()
-
-class AdminState(StatesGroup):
-    waiting_crash_x = State()
-    waiting_card_number = State()
 
 class DepositState(StatesGroup):
     waiting_amount = State()
@@ -166,13 +163,15 @@ class WithdrawState(StatesGroup):
     waiting_amount = State()
     waiting_card_and_name = State()
 
+class AdminState(StatesGroup):
+    waiting_card_number = State()
+
 
 # =========================================================
-# KLAVIATURALAR
+# ASOSIY MENYU
 # =========================================================
 def main_menu(user_id: int):
     kb = [
-        [InlineKeyboardButton(text="🚀 Crash O'yini", callback_data="play_crash")],
         [InlineKeyboardButton(text="💣 Mines O'yini", callback_data="play_mines")],
         [InlineKeyboardButton(text="⛏ Mining (+100 coin)", callback_data="mining_section")],
         [InlineKeyboardButton(text="💰 Balans", callback_data="my_balance")],
@@ -186,9 +185,6 @@ def main_menu(user_id: int):
     return InlineKeyboardMarkup(inline_keyboard=kb)
 
 
-# =========================================================
-# START VA ASOSIY MENYU
-# =========================================================
 @dp.message(F.text == "/start")
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
@@ -198,7 +194,7 @@ async def cmd_start(message: Message, state: FSMContext):
     await message.answer(
         f"✨ <b>XUSH KELIBSIZ, {message.from_user.first_name}!</b> ✨\n"
         f"──────────────────────────\n"
-        f"🚀 <b>Crash</b> va <b>Mines</b> o'yinlarida qatnashing va pul yutib oling!\n\n"
+        f"💣 <b>Mines</b> o'yinida qatnashing, kataklarni ochib X larni yig'ing va pul yutib oling!\n\n"
         f"💰 <b>Balansingiz:</b> {money(balance)} coin\n"
         f"──────────────────────────",
         reply_markup=main_menu(user_id),
@@ -233,7 +229,7 @@ async def my_balance_handler(callback: CallbackQuery):
 
 
 # =========================================================
-# 💣 MINES O'YINI MANTIQLARI VA TAKTIkasi
+# 💣 MINES O'YINI VA TAKTIKASI
 # =========================================================
 @dp.callback_query(F.data == "play_mines")
 async def play_mines_menu(callback: CallbackQuery, state: FSMContext):
@@ -242,7 +238,7 @@ async def play_mines_menu(callback: CallbackQuery, state: FSMContext):
     await callback.message.edit_text(
         f"💣 <b>MINES O'YINI</b>\n"
         f"──────────────────────────\n"
-        f"🎯 Xavfsiz kataklarni tanlang va koeffitsiyentlarni oshiring!\n\n"
+        f"🎯 Xavfsiz kataklarni tanlang va koeffitsiyentlarni (X) oshiring!\n\n"
         f"💰 Balansingiz: <b>{money(balance)} coin</b>\n"
         f"Stavka miqdorini kiriting (min: 100 coin):",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Orqaga", callback_data="back_to_menu")]]),
@@ -266,24 +262,26 @@ async def process_mines_bet(message: Message, state: FSMContext):
     await change_balance(user_id, -bet)
     await state.clear()
 
-    # O'yin statistikasini boshqarish
+    # O'yin statistikasini boshqarish (Taktika uchun)
     if user_id not in user_total_games:
         user_total_games[user_id] = 1
     else:
         user_total_games[user_id] += 1
         
-    if user_total_games[user_id] > 9:
+    if user_total_games[user_id] > 6:
         user_total_games[user_id] = 1
         
     user_game_steps[user_id] = 0
     user_mines_bets[user_id] = bet
     game_num = user_total_games[user_id]
 
+    current_x = 1.00
     await message.answer(
-        f"💣 <b>Mines o'yini boshlandi!</b> (O'yin #{game_num})\n"
-        f"💰 Stavka: <b>{money(bet)} coin</b>\n\n"
-        f"Kataklardan birini tanlang:",
-        reply_markup=get_mines_keyboard(),
+        f"💣 <b>Mines o'yini boshlandi!</b> (Taktika O'yini #{game_num})\n"
+        f"💰 Stavka: <b>{money(bet)} coin</b>\n"
+        f"📈 Hozirgi X: <b>{current_x:.2f}x</b>\n\n"
+        f"Xavfsiz katakni tanlang:",
+        reply_markup=get_mines_keyboard(0, current_x, bet),
         parse_mode=ParseMode.HTML
     )
 
@@ -292,7 +290,7 @@ async def process_mine_click(callback: CallbackQuery):
     user_id = callback.from_user.id
     
     if user_id not in user_game_steps or user_id not in user_mines_bets:
-        await callback.answer("⚠️ Faol o'yin topilmadi! Qaytadan /start bosing.", show_alert=True)
+        await callback.answer("⚠️ Faol o'yin topilmadi! /start bosing.", show_alert=True)
         return
 
     game_num = user_total_games.get(user_id, 1)
@@ -300,56 +298,45 @@ async def process_mine_click(callback: CallbackQuery):
     user_game_steps[user_id] = step
 
     is_boom = False
-    is_win = False
-
-    # Berilgan taktika shartlari
-    if game_num == 1:
-        if step > 3:
-            is_boom = True
-    elif game_num in [2, 3, 4]:
+    
+    # Taktika shartlari (Minaga urilish ehtimoli)
+    if game_num == 1 and step > 3:
         is_boom = True
-    elif game_num == 5:
-        if step > 3:
-            is_boom = True
-    elif game_num in [6, 7]:
+    elif game_num in [2, 3] and step > 2:
         is_boom = True
-    elif game_num in [8, 9]:
-        if step >= 3:
-            is_win = True
+    elif game_num in [4, 5] and step > 4:
+        is_boom = True
 
-    current_x = MINES_MULTIPLIERS.get(step, 2.00)
+    current_x = MINES_MULTIPLIERS.get(step, 1.20)
     bet = user_mines_bets[user_id]
+    current_win = int(bet * current_x)
 
-    if is_win or step >= 3:
-        win_amount = int(bet * current_x)
-        await change_balance(user_id, win_amount)
-        balance = await get_balance(user_id)
-        
-        # O'chirib tashlaymiz
+    if is_boom:
         user_game_steps.pop(user_id, None)
         user_mines_bets.pop(user_id, None)
 
         await callback.message.edit_text(
-            f"🎉 <b>Tabriklaymiz! Siz {step} ta qadamni bosib o'tdingiz!</b> 🏆\n"
-            f"📈 Koeffitsiyent: <b>{current_x:.2f}x</b>\n"
-            f"💰 Yutuq: <b>+{money(win_amount)} coin</b>\n"
-            f"💳 Yangi balans: {money(balance)} coin\n\n"
-            f"Qaytadan o'ynash uchun /start ni bosing.",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="💣 Qaytadan o'ynash", callback_data="play_mines")]]),
-            parse_mode=ParseMode.HTML
-        )
-    elif is_boom:
-        user_game_steps.pop(user_id, None)
-        user_mines_bets.pop(user_id, None)
-
-        await callback.message.edit_text(
-            f"💥 <b>Boom! Qadam #{step}. Minaga bosib yutqazdingiz!</b> 😢\n"
-            f"Qaytadan o'ynash uchun /start ni bosing.",
+            f"💥 <b>Boom! Minaga bosib yutqazdingiz!</b> 😢\n"
+            f"Bosqich: {step} | Oxirgi X: {current_x:.2f}x\n\n"
+            f"Qaytadan o'ynash uchun tugmani bosing:",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="💣 Qaytadan o'ynash", callback_data="play_mines")]]),
             parse_mode=ParseMode.HTML
         )
     else:
-        await callback.answer(f"✅ Qadam #{step}: Xavfsiz katak! X: {current_x:.2f}x. Davom eting.", show_alert=False)
+        await callback.answer(f"✅ Qadam #{step}: Muvaffaqiyatli! X: {current_x:.2f}x", show_alert=False)
+        try:
+            await callback.message.edit_text(
+                f"💣 <b>Mines o'yini davom etmoqda...</b>\n"
+                f"💰 Stavka: <b>{money(bet)} coin</b>\n"
+                f"🎯 Ochilgan kataklar: <b>{step} ta</b>\n"
+                f"📈 Koeffitsiyent: <b>{current_x:.2f}x</b>\n"
+                f"💵 Hozirgi yutuq: <b>{money(current_win)} coin</b>\n\n"
+                f"Keyingi katakni tanlang yoki pulni oling:",
+                reply_markup=get_mines_keyboard(step, current_x, bet),
+                parse_mode=ParseMode.HTML
+            )
+        except Exception:
+            pass
 
 @dp.callback_query(F.data == "mines_cashout")
 async def mines_cashout_handler(callback: CallbackQuery):
@@ -472,14 +459,13 @@ async def claim_mining_handler(callback: CallbackQuery):
 
 
 # =========================================================
-# 📥 DEPOZIT VA 📤 PUL CHIQARISH TIZIMI
+# 📥 DEPOZIT VA 📤 PUL CHIQARISH
 # =========================================================
 @dp.callback_query(F.data == "deposit_money")
 async def deposit_start(callback: CallbackQuery, state: FSMContext):
     await state.set_state(DepositState.waiting_amount)
     await callback.message.edit_text(
-        "📥 <b>DEPOZIT QILISH</b>\n"
-        "Qancha pul kiritmoqchisiz? (Min: 5 000 coin):",
+        "📥 <b>DEPOZIT QILISH</b>\nQancha pul kiritmoqchisiz? (Min: 5 000 coin):",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Bekor qilish", callback_data="back_to_menu")]]),
         parse_mode=ParseMode.HTML
     )
@@ -487,7 +473,7 @@ async def deposit_start(callback: CallbackQuery, state: FSMContext):
 @dp.message(DepositState.waiting_amount)
 async def deposit_amount_process(message: Message, state: FSMContext):
     if not message.text or not message.text.isdigit():
-        await message.answer("❌ Faqat musbat raqam kiriting:")
+        await message.answer("❌ Faqat raqam kiriting:")
         return
 
     amount = int(message.text)
@@ -534,7 +520,7 @@ async def deposit_proof_process(message: Message, state: FSMContext):
     )
 
     await state.clear()
-    await message.answer("✅ Chek adminga yuborildi!", reply_markup=main_menu(user_id), parse_mode=ParseMode.HTML)
+    await message.answer("✅ Chek adminga yuborildi!", reply_markup=main_menu(user_id))
 
 
 @dp.callback_query(F.data == "withdraw_money")
@@ -592,7 +578,7 @@ async def withdraw_card_process(message: Message, state: FSMContext):
         reply_markup=admin_kb,
         parse_mode=ParseMode.HTML
     )
-    await message.answer("✅ So'rov yuborildi!", reply_markup=main_menu(user_id))
+    await message.answer("✅ So'rov adminga yuborildi!", reply_markup=main_menu(user_id))
 
 
 # =========================================================
@@ -682,5 +668,4 @@ if __name__ == "__main__":
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         print("Bot to'xtatildi!")
-
 

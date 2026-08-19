@@ -221,6 +221,7 @@ class WithdrawState(StatesGroup):
 def main_menu(user_id: int):
     kb = [
         [InlineKeyboardButton(text="🚀 Crash O'yini", callback_data="play_crash")],
+        [InlineKeyboardButton(text="💣 Mines O'yini (/mines)", callback_data="play_mines_menu")],
         [InlineKeyboardButton(text="⛏ Mining (+100 coin)", callback_data="mining_section")],
         [InlineKeyboardButton(text="💰 Balans", callback_data="my_balance")],
         [
@@ -244,7 +245,7 @@ async def cmd_start(message: Message, state: FSMContext):
     await message.answer(
         f"✨ <b>XUSH KELIBSIZ, {message.from_user.first_name}!</b> ✨\n"
         f"──────────────────────────\n"
-        f"🚀 <b>Crash</b> o'yinida qatnashing va pul yutib oling!\n\n"
+        f"🚀 <b>Crash</b> va <b>Mines</b> o'yinlarida qatnashing!\n\n"
         f"💰 <b>Balansingiz:</b> {money(balance)} coin\n"
         f"──────────────────────────",
         reply_markup=main_menu(user_id),
@@ -267,6 +268,23 @@ async def back_to_menu_callback(callback: CallbackQuery, state: FSMContext):
 async def my_balance_handler(callback: CallbackQuery):
     balance = await get_balance(callback.from_user.id)
     await callback.answer(f"💰 Balansingiz: {money(balance)} coin", show_alert=True)
+
+@dp.callback_query(F.data == "play_mines_menu")
+async def play_mines_menu_handler(callback: CallbackQuery):
+    await callback.message.edit_text(
+        "💣 <b>MINES O'YINI</b>\n"
+        "──────────────────────────\n"
+        "O'yinni boshlash uchun quyidagi tugmani bosing yoki /mines buyrug'ini yuboring:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🎮 O'yinni boshlash (/mines)", callback_data="start_mines_action")],
+            [InlineKeyboardButton(text="⬅️ Orqaga", callback_data="back_to_menu")]
+        ]),
+        parse_mode=ParseMode.HTML
+    )
+
+@dp.callback_query(F.data == "start_mines_action")
+async def start_mines_action_handler(callback: CallbackQuery):
+    await start_mines(callback.message)
 
 # =========================================================
 # ⛏ MINING BO'LIMI

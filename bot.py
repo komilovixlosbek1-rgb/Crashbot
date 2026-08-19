@@ -1,6 +1,8 @@
 import asyncio
 import logging
+import os
 import sqlite3
+import random
 import time
 from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ParseMode
@@ -9,21 +11,13 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 TOKEN = "8925068569:AAF0Rc5EgaUzBFLvwieF_IBnqQcmAC7n7aQ"
-ADMIN_ID = 8252674515  # Admin Telegram ID si
+ADMIN_ID = 8252674515  # Admin Telegram ID SI
 DB_NAME = "crash_bot.db"
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
-TARGET_CRASH_X = 2.00
-
-# O'yin holatlari (Saytga o'xshash global o'yin)
-CRASH_GAME = {
-    "status": "waiting",  # waiting, flying, crashed
-    "multiplier": 1.00,
-    "bets": {},           # user_id: {"bet": amount, "cashed": False, "name": name}
-    "message_ids": {}     # user_id: message_id
-}
+ACTIVE_GAMES = {}
 
 
 # =========================================================
@@ -48,17 +42,19 @@ async def init_db():
         db_query,
         '''CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
+            username TEXT,
             balance INTEGER DEFAULT 10000,
             has_deposited INTEGER DEFAULT 0
         )''',
         commit=True
     )
+    # Agar jadval ilgaridan mavjud bo'lsa, ustunlarni tekshirib qo'shamiz
     try:
-        await asyncio.to_thread(
-            db_query,
-            '''ALTER TABLE users ADD COLUMN has_deposited INTEGER DEFAULT 0''',
-            commit=True
-        )
+        await asyncio.to_thread(db_query, '''ALTER TABLE users ADD COLUMN has_deposited INTEGER DEFAULT 0''', commit=True)
+    except Exception:
+        pass
+    try:
+        await asyncio.to_thread(db_query, '''ALTER TABLE users ADD COLUMN username TEXT''', commit=True)
     except Exception:
         pass
 
@@ -78,23 +74,68 @@ async def init_db():
         )''',
         commit=True
     )
+    # O'yinlar tarixi jadvali
+    await asyncio.to_thread(
+        db_query,
+        '''CREATE TABLE IF NOT EXISTS crash_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            multiplier REAL,
+            mode TEXT,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+        )''',
+        commit=True
+    )
+    # Tranzaksiyalar jadvali
+    await asyncio.to_thread(
+        db_query,
+        '''CREATE TABLE IF NOT EXISTS transactions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            type TEXT,
+            amount REAL,
+            status TEXT DEFAULT 'Kutilmoqda',
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+        )''',
+        commit=True
+    )
+
+    # Boshlang'ich sozlamalar
     card = await asyncio.to_thread(db_query, "SELECT value FROM settings WHERE key = 'card_number'", fetchone=True)
     if not card:
         await asyncio.to_thread(db_query, "INSERT INTO settings (key, value) VALUES ('card_number', 'Kiritilmagan')", commit=True)
+    
+    mode = await asyncio.to_thread(db_query, "SELECT value FROM settings WHERE key = 'crash_mode'", fetchone=True)
+    if not mode:
+        await asyncio.to_thread(db_query, "INSERT INTO settings (key, value) VALUES ('crash_mode', 'admin')", commit=True)
+
+    mult = await asyncio.to_thread(db_query, "SELECT value FROM settings WHERE key = 'admin_multiplier'", fetchone=True)
+    if not mult:
+        await asyncio.to_thread(db_query, "INSERT INTO settings (key, value) VALUES ('admin_multiplier', '2.00')", commit=True)
+
+    streak = await asyncio.to_thread(db_query, "SELECT value FROM settings WHERE key = 'admin_streak'", fetchone=True)
+    if not streak:
+        await asyncio.to_thread(db_query, "INSERT INTO settings (key, value) VALUES ('admin_streak', '0')", commit=True)
+
+async def get_setting(key: str) -> str:
+    row = await asyncio.to_thread(db_query, "SELECT value FROM settings WHERE key = ?", (key,), fetchone=True)
+    return row[0] if row else ""
+
+async def update_setting(key: str, value: str):
+    await asyncio.to_thread(db_query, "UPDATE settings SET value = ? WHERE key = ?", (str(value), key), commit=True)
 
 async def get_card_number() -> str:
-    row = await asyncio.to_thread(db_query, "SELECT value FROM settings WHERE key = 'card_number'", fetchone=True)
-    return row[0] if row else "Kiritilmagan"
+    return await get_setting("card_number")
 
 async def set_card_number(card: str):
-    await asyncio.to_thread(db_query, "UPDATE settings SET value = ? WHERE key = 'card_number'", (card,), commit=True)
+    await update_setting("card_number", card)
 
-async def get_balance(user_id: int) -> int:
+async def get_balance(user_id: int, username: str = None) -> int:
     row = await asyncio.to_thread(db_query, "SELECT balance FROM users WHERE user_id = ?", (user_id,), fetchone=True)
     if row:
         return row[0]
     else:
-        await asyncio.to_thread(db_query, "INSERT INTO users (user_id, balance, has_deposited) VALUES (?, 10000, 0)", (user_id,), commit=True)
+        uname = username or "Noma'lum"
+        await asyncio.to_thread(db_query, "INSERT INTO users (user_id, username, balance, has_deposited) VALUES (?, ?, 10000, 0)", (user_id, uname), commit=True)
         return 10000
 
 async def change_balance(user_id: int, amount: int):
@@ -132,6 +173,9 @@ class CrashState(StatesGroup):
 class AdminState(StatesGroup):
     waiting_crash_x = State()
     waiting_card_number = State()
+    waiting_user_id = State()
+    waiting_amount = State()
+    waiting_broadcast = State()
 
 class DepositState(StatesGroup):
     waiting_amount = State()
@@ -167,7 +211,8 @@ def main_menu(user_id: int):
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
     user_id = message.from_user.id
-    balance = await get_balance(user_id)
+    username = f"@{message.from_user.username}" if message.from_user.username else message.from_user.full_name
+    balance = await get_balance(user_id, username)
 
     await message.answer(
         f"✨ <b>XUSH KELIBSIZ, {message.from_user.first_name}!</b> ✨\n"
@@ -203,7 +248,8 @@ async def my_balance_handler(callback: CallbackQuery):
 @dp.callback_query(F.data == "mining_section")
 async def mining_handler(callback: CallbackQuery):
     user_id = callback.from_user.id
-    if not await check_user_deposited(user_id):
+    is_deposited = await check_user_deposited(user_id)
+    if not is_deposited:
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="📥 Depozit Qilish", callback_data="deposit_money")],
             [InlineKeyboardButton(text="⬅️ Orqaga", callback_data="back_to_menu")]
@@ -211,8 +257,10 @@ async def mining_handler(callback: CallbackQuery):
         await callback.message.edit_text(
             f"🔒 <b>MINING BO'LIMI YOPILGAN!</b>\n"
             f"──────────────────────────\n"
-            f"⚠️ Mining bo'limiga ulanish uchun kamida <b>1 marta depozit</b> qilishingiz kerak!",
-            reply_markup=kb, parse_mode=ParseMode.HTML
+            f"⚠️ Mining bo'limiga ulanish uchun kamida <b>1 marta depozit</b> qilishingiz kerak!\n\n"
+            f"💡 Depozit qilsangiz har 1 soatda 100 coin bonus olish imkoniyatiga ega bo'lasiz.",
+            reply_markup=kb,
+            parse_mode=ParseMode.HTML
         )
         return
 
@@ -227,19 +275,27 @@ async def mining_handler(callback: CallbackQuery):
             [InlineKeyboardButton(text="⬅️ Orqaga", callback_data="back_to_menu")]
         ])
         await callback.message.edit_text(
-            f"⛏ <b>MINING BO'LIMI</b>\n──────────────────────────\n🎁 <b>Tayyor!</b> Balansingizga 100 coin qo'shishingiz mumkin.",
-            reply_markup=kb, parse_mode=ParseMode.HTML
+            f"⛏ <b>MINING BO'LIMI</b>\n"
+            f"──────────────────────────\n"
+            f"🎁 <b>Tayyor!</b> Balansingizga 100 coin qo'shishingiz mumkin.\n\n"
+            f"💡 Har 1 soatda kiring va bepul bonusni oling!",
+            reply_markup=kb,
+            parse_mode=ParseMode.HTML
         )
     else:
         remaining = cooldown - elapsed
-        minutes, seconds = remaining // 60, remaining % 60
+        minutes = remaining // 60
+        seconds = remaining % 60
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🔄 Yangilash", callback_data="mining_section")],
             [InlineKeyboardButton(text="⬅️ Orqaga", callback_data="back_to_menu")]
         ])
         await callback.message.edit_text(
-            f"⛏ <b>MINING BO'LIMI</b>\n──────────────────────────\n⏳ <b>Keyingi bonusgacha:</b> {minutes}d {seconds}s qoldi.",
-            reply_markup=kb, parse_mode=ParseMode.HTML
+            f"⛏ <b>MINING BO'LIMI</b>\n"
+            f"──────────────────────────\n"
+            f"⏳ <b>Keyingi bonus tayyor bo'lishiga:</b> {minutes} daqiqa {seconds} soniya qoldi.",
+            reply_markup=kb,
+            parse_mode=ParseMode.HTML
         )
 
 @dp.callback_query(F.data == "claim_mining")
@@ -250,62 +306,93 @@ async def claim_mining_handler(callback: CallbackQuery):
         return
 
     current_time = int(time.time())
-    if current_time - await get_last_claim(user_id) < 3600:
+    last_claim = await get_last_claim(user_id)
+    if current_time - last_claim < 3600:
         await callback.answer("⏳ Hali 1 soat o'tmadi!", show_alert=True)
         return
 
     await change_balance(user_id, 100)
     await update_last_claim(user_id, current_time)
     balance = await get_balance(user_id)
-    await callback.answer("🎉 +100 coin qo'shildi!", show_alert=True)
+    await callback.answer("🎉 +100 coin balansingizga qo'shildi!", show_alert=True)
+    
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 Holatni tekshirish", callback_data="mining_section")],
+        [InlineKeyboardButton(text="🏠 Asosiy Menyu", callback_data="back_to_menu")]
+    ])
     await callback.message.edit_text(
-        f"✅ <b>100 coin olindi!</b>\n💰 Yangi balans: <b>{money(balance)} coin</b>",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🏠 Asosiy Menyu", callback_data="back_to_menu")]]),
+        f"⛏ <b>MINING BO'LIMI</b>\n"
+        f"──────────────────────────\n"
+        f"✅ <b>100 coin olindi!</b> Yangi balans: <b>{money(balance)} coin</b>",
+        reply_markup=kb,
         parse_mode=ParseMode.HTML
     )
 
 
 # =========================================================
-# 📥 DEPOZIT VA PUL CHIQARISH TIZIMI
+# 📥 DEPOZIT VA 📤 PUL CHIQARISH TIZIMLARI
 # =========================================================
 @dp.callback_query(F.data == "deposit_money")
 async def deposit_start(callback: CallbackQuery, state: FSMContext):
     await state.set_state(DepositState.waiting_amount)
     await callback.message.edit_text(
-        "📥 <b>DEPOZIT QILISH</b>\nQancha pul kiritmoqchisiz? (Min: 5 000 coin):",
+        "📥 <b>DEPOZIT QILISH</b>\n"
+        "──────────────────────────\n"
+        "Qancha pul kiritmoqchisiz? (Min: 5 000 coin)\nSummani raqamda yozing:",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Bekor qilish", callback_data="back_to_menu")]]),
         parse_mode=ParseMode.HTML
     )
 
 @dp.message(DepositState.waiting_amount)
 async def deposit_amount_process(message: Message, state: FSMContext):
-    if not message.text or not message.text.isdigit() or int(message.text) < 5000:
-        await message.answer("❌ Minimal summa 5 000 coin. Qayta kiriting:")
+    if not message.text or not message.text.isdigit():
+        await message.answer("❌ Faqat raqam kiriting:")
         return
-    await state.update_data(deposit_amount=int(message.text))
+    amount = int(message.text)
+    if amount < 5000:
+        await message.answer("❌ Minimal summa 5 000 coin!")
+        return
+
+    await state.update_data(deposit_amount=amount)
     await state.set_state(DepositState.waiting_proof)
     card_num = await get_card_number()
     await message.answer(
-        f"💳 Karta raqami: <code>{card_num}</code>\nTo'lov cheki **skrinshotini** yuboring:",
+        f"💳 <b>TO'LOV MA'LUMOTLARI:</b>\n"
+        f"Summa: <b>{money(amount)} so'm/coin</b>\n"
+        f"Karta: <code>{card_num}</code>\n\n"
+        f"📸 <b>To'lov cheki skrinshotini yuboring!</b>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Bekor qilish", callback_data="back_to_menu")]]),
         parse_mode=ParseMode.HTML
     )
 
 @dp.message(DepositState.waiting_proof)
 async def deposit_proof_process(message: Message, state: FSMContext):
     if not message.photo:
-        await message.answer("❌ Iltimos, chek rasmini yuboring!")
+        await message.answer("❌ Iltimos, chek skrinshotini rasm ko'rinishida yuboring!")
         return
+
     data = await state.get_data()
     amount = data.get("deposit_amount")
     user_id = message.from_user.id
+    username = f"@{message.from_user.username}" if message.from_user.username else "Mavjud emas"
+
     admin_kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Tasdiqlash", callback_data=f"dep_app:{user_id}:{amount}"),
-         InlineKeyboardButton(text="❌ Rad etish", callback_data=f"dep_rej:{user_id}")]
+        [
+            InlineKeyboardButton(text="✅ Tasdiqlash", callback_data=f"dep_app:{user_id}:{amount}"),
+            InlineKeyboardButton(text="❌ Rad etish", callback_data=f"dep_rej:{user_id}")
+        ]
     ])
+
     await bot.send_photo(
-        chat_id=ADMIN_ID, photo=message.photo[-1].file_id,
-        caption=f"📥 <b>YANGI DEPOZIT SO'ROVI</b>\nID: <code>{user_id}</code>\nSumma: <b>{money(amount)} coin</b>",
-        reply_markup=admin_kb, parse_mode=ParseMode.HTML
+        chat_id=ADMIN_ID,
+        photo=message.photo[-1].file_id,
+        caption=f"📥 <b>YANGI DEPOZIT SO'ROVI</b>\n"
+                f"Foydalanuvchi: {message.from_user.full_name} ({username})\n"
+                f"ID: <code>{user_id}</code>\n"
+                f"Summa: <b>{money(amount)} coin</b>\n"
+                f"Izoh: {message.caption or 'Kiritilmagan'}",
+        reply_markup=admin_kb,
+        parse_mode=ParseMode.HTML
     )
     await state.clear()
     await message.answer("✅ Chek adminga yuborildi!", reply_markup=main_menu(user_id))
@@ -314,54 +401,74 @@ async def deposit_proof_process(message: Message, state: FSMContext):
 async def withdraw_start(callback: CallbackQuery, state: FSMContext):
     balance = await get_balance(callback.from_user.id)
     if balance < 10000:
-        await callback.answer("❌ Minimal chiqarish: 10 000 coin.", show_alert=True)
+        await callback.answer("❌ Minimal chiqarish summasi 10 000 coin!", show_alert=True)
         return
     await state.set_state(WithdrawState.waiting_amount)
     await callback.message.edit_text(
-        f"📤 <b>PUL CHIQARISH</b>\nBalans: {money(balance)} coin\nChiqarmoqchi bo'lgan summani yozing:",
+        f"📤 <b>PUL CHIQARISH</b>\nBalans: <b>{money(balance)} coin</b>\nQancha chiqarmoqchisiz?",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Bekor qilish", callback_data="back_to_menu")]]),
         parse_mode=ParseMode.HTML
     )
 
 @dp.message(WithdrawState.waiting_amount)
 async def withdraw_amount_process(message: Message, state: FSMContext):
-    if not message.text or not message.text.isdigit() or int(message.text) < 10000:
-        await message.answer("❌ Min: 10 000 coin. Qayta kiriting:")
+    if not message.text or not message.text.isdigit():
+        await message.answer("❌ Faqat raqam kiriting:")
         return
-    await state.update_data(withdraw_amount=int(message.text))
+    amount = int(message.text)
+    user_id = message.from_user.id
+    balance = await get_balance(user_id)
+    if amount < 10000 or amount > balance:
+        await message.answer("❌ Miqdor noto'g'ri yoki balansda mablag' yetarli emas!")
+        return
+
+    await state.update_data(withdraw_amount=amount)
     await state.set_state(WithdrawState.waiting_card_and_name)
-    await message.answer("💳 Karta raqami va egasining ismini yuboring:", parse_mode=ParseMode.HTML)
+    await message.answer("💳 Karta raqamingiz va ism-sharifingizni yuboring (Masalan: 8600... — Ism):")
 
 @dp.message(WithdrawState.waiting_card_and_name)
 async def withdraw_card_process(message: Message, state: FSMContext):
     data = await state.get_data()
     amount = data.get("withdraw_amount")
     user_id = message.from_user.id
-    if amount > await get_balance(user_id):
-        await state.clear()
-        await message.answer("❌ Mablag' yetarli emas!", reply_markup=main_menu(user_id))
-        return
+    card_details = message.text.strip()
+
     await change_balance(user_id, -amount)
     await state.clear()
+
+    username = f"@{message.from_user.username}" if message.from_user.username else "Mavjud emas"
     admin_kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ To'lab berildi", callback_data=f"with_app:{user_id}"),
-         InlineKeyboardButton(text="❌ Qaytarish", callback_data=f"with_rej:{user_id}:{amount}")]
+        [
+            InlineKeyboardButton(text="✅ To'lab berildi", callback_data=f"with_app:{user_id}"),
+            InlineKeyboardButton(text="❌ Rad etish", callback_data=f"with_rej:{user_id}:{amount}")
+        ]
     ])
+
     await bot.send_message(
         chat_id=ADMIN_ID,
-        text=f"📤 <b>PUL CHIQARISH SO'ROVI</b>\nID: <code>{user_id}</code>\nSumma: <b>{money(amount)} coin</b>\nKarta: <code>{message.text}</code>",
-        reply_markup=admin_kb, parse_mode=ParseMode.HTML
+        text=f"📤 <b>PUL CHIQARISH SO'ROVI</b>\n"
+             f"Foydalanuvchi: {message.from_user.full_name} ({username})\n"
+             f"ID: <code>{user_id}</code>\n"
+             f"Summa: <b>{money(amount)} coin</b>\n"
+             f"Karta: <code>{card_details}</code>",
+        reply_markup=admin_kb,
+        parse_mode=ParseMode.HTML
     )
     await message.answer("✅ So'rov yuborildi!", reply_markup=main_menu(user_id))
 
+
+# =========================================================
+# ADMIN AKSIYALARI VA TASDIQLASH
+# =========================================================
 @dp.callback_query(F.data.startswith("dep_app:"))
 async def approve_deposit(callback: CallbackQuery):
     _, u_id, amt = callback.data.split(":")
-    await change_balance(int(u_id), int(amt))
-    await set_user_deposited(int(u_id))
+    user_id, amount = int(u_id), int(amt)
+    await change_balance(user_id, amount)
+    await set_user_deposited(user_id)
     await callback.answer("✅ Tasdiqlandi!")
     await callback.message.edit_caption(caption=callback.message.caption + "\n\n🟢 <b>STATUS: TASDIQLANDI</b>", parse_mode=ParseMode.HTML)
-    await bot.send_message(int(u_id), f"🎉 <b>Hisobingizga +{money(int(amt))} coin qo'shildi!</b>", parse_mode=ParseMode.HTML)
+    await bot.send_message(user_id, f"🎉 Hisobingizga +{money(amount)} coin qo'shildi va Mining ochildi!", parse_mode=ParseMode.HTML)
 
 @dp.callback_query(F.data.startswith("dep_rej:"))
 async def reject_deposit(callback: CallbackQuery):
@@ -378,70 +485,217 @@ async def approve_withdraw(callback: CallbackQuery):
 @dp.callback_query(F.data.startswith("with_rej:"))
 async def reject_withdraw(callback: CallbackQuery):
     _, u_id, amt = callback.data.split(":")
-    await change_balance(int(u_id), int(amt))
-    await callback.answer("❌ Rad etildi, pul qaytarildi!")
+    user_id, amount = int(u_id), int(amt)
+    await change_balance(user_id, amount)
+    await callback.answer("❌ Qaytarildi!")
     await callback.message.edit_text(callback.message.text + "\n\n🔴 <b>STATUS: RAD ETILDI (PUL QAYTARILDI)</b>", parse_mode=ParseMode.HTML)
-    await bot.send_message(int(u_id), f"❌ Pul chiqarish rad etildi, {money(int(amt))} coin qaytarildi.", parse_mode=ParseMode.HTML)
+    await bot.send_message(user_id, f"❌ Pul chiqarish so'rovingiz rad etilib, {money(amount)} coin balansga qaytarildi.", parse_mode=ParseMode.HTML)
 
 
 # =========================================================
-# ADMIN PANEL
+# 👨‍💼 ADMIN PANEL VA Kengaytirilgan Sozlamalar
 # =========================================================
 @dp.callback_query(F.data == "admin_panel")
 async def admin_panel_handler(callback: CallbackQuery, state: FSMContext):
     if callback.from_user.id != ADMIN_ID: return
     await state.clear()
+    users_count = await get_users_count()
+    card_num = await get_card_number()
+    cur_x = await get_setting("admin_multiplier")
+    mode = await get_setting("crash_mode")
+    
     await callback.message.edit_text(
-        f"👨‍💼 <b>ADMIN PANEL</b>\nJami foydalanuvchilar: {await get_users_count()} ta\nCrash X: {TARGET_CRASH_X:.2f}x",
+        f"👨‍💼 <b>ADMIN PANEL</b>\n"
+        f"──────────────────────────\n"
+        f"👥 Jami foydalanuvchilar: <b>{users_count} ta</b>\n"
+        f"🎯 Hozirgi Crash Rejim: <b>{mode.upper()}</b>\n"
+        f"⚙️ Admin X qiymati: <b>{cur_x}x</b>\n"
+        f"💳 Karta raqami: <code>{card_num}</code>\n"
+        f"──────────────────────────",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="👥 Foydalanuvchilar ro'yxati", callback_data="admin_users")],
+            [InlineKeyboardButton(text="📊 Statistika", callback_data="admin_stats")],
+            [InlineKeyboardButton(text="🎮 Crash O'yinlar tarixi", callback_data="admin_history")],
             [InlineKeyboardButton(text="⚙️ Crash X ni o'zgartirish", callback_data="set_crash_x")],
             [InlineKeyboardButton(text="💳 Kartani o'zgartirish", callback_data="set_card")],
-            [InlineKeyboardButton(text="⬅️ Orqaga", callback_data="back_to_menu")]
-        ]), parse_mode=ParseMode.HTML
+            [InlineKeyboardButton(text="➕ Coin berish", callback_data="admin_add_coin")],
+            [InlineKeyboardButton(text="➖ Coin ayirish", callback_data="admin_sub_coin")],
+            [InlineKeyboardButton(text="📢 Xabar yuborish", callback_data="admin_broadcast")],
+            [InlineKeyboardButton(text="🏠 Asosiy menyu", callback_data="back_to_menu")]
+        ]),
+        parse_mode=ParseMode.HTML
     )
+
+@dp.callback_query(F.data == "admin_users")
+async def admin_users_callback(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID: return
+    count = await get_users_count()
+    await callback.answer(f"Jami foydalanuvchilar: {count} ta", show_alert=True)
+
+@dp.callback_query(F.data == "admin_stats")
+async def admin_stats_callback(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID: return
+    row = await asyncio.to_thread(db_query, "SELECT COUNT(*), SUM(balance) FROM users", fetchone=True)
+    games = await asyncio.to_thread(db_query, "SELECT COUNT(*) FROM crash_history", fetchone=True)
+    await callback.answer(f"Foydalanuvchilar: {row[0]}\nUmumiy balans: {money(row[1] or 0)} coin\nO'yinlar soni: {games[0]}", show_alert=True)
+
+@dp.callback_query(F.data == "admin_history")
+async def admin_history_callback(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID: return
+    rows = await asyncio.to_thread(db_query, "SELECT multiplier, mode, timestamp FROM crash_history ORDER BY id DESC LIMIT 10", fetchall=True)
+    text = "🎮 <b>Oxirgi 10 ta Crash o'yini:</b>\n\n"
+    for r in rows:
+        text += f"• X: <b>{r[0]}x</b> | Rejim: {r[1]} | {r[2]}\n"
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Orqaga", callback_data="admin_panel")]]), parse_mode=ParseMode.HTML)
 
 @dp.callback_query(F.data == "set_card")
 async def set_card_prompt(callback: CallbackQuery, state: FSMContext):
     if callback.from_user.id != ADMIN_ID: return
     await state.set_state(AdminState.waiting_card_number)
-    await callback.message.edit_text("💳 Yangi karta raqamini kiriting:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Orqaga", callback_data="admin_panel")]]))
+    await callback.message.edit_text("💳 Yangi karta raqamini kiriting:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Bekor", callback_data="admin_panel")]]))
 
 @dp.message(AdminState.waiting_card_number)
 async def process_set_card(message: Message, state: FSMContext):
     if message.from_user.id != ADMIN_ID: return
     await set_card_number(message.text.strip())
     await state.clear()
-    await message.answer("✅ Karta yangilandi!", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Admin Panel", callback_data="admin_panel")]]))
+    await message.answer("✅ Karta yangilandi!", reply_markup=main_menu(message.from_user.id))
 
 @dp.callback_query(F.data == "set_crash_x")
 async def set_crash_x_prompt(callback: CallbackQuery, state: FSMContext):
     if callback.from_user.id != ADMIN_ID: return
     await state.set_state(AdminState.waiting_crash_x)
-    await callback.message.edit_text("⚙️ Yangi Crash X qiymatini kiriting (masalan: 2.5):", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Orqaga", callback_data="admin_panel")]]))
+    await callback.message.edit_text("⚙️ Admin X qiymatini kiriting (masalan: 2.50):", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Bekor", callback_data="admin_panel")]]))
 
 @dp.message(AdminState.waiting_crash_x)
 async def process_set_crash_x(message: Message, state: FSMContext):
-    global TARGET_CRASH_X
+    if message.from_user.id != ADMIN_ID: return
     try:
         val = float(message.text.replace(",", "."))
-        if val <= 1.0: return
-        TARGET_CRASH_X = round(val, 2)
+        await update_setting("admin_multiplier", str(val))
         await state.clear()
-        await message.answer(f"✅ Yangi Crash X: {TARGET_CRASH_X:.2f}x", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Admin Panel", callback_data="admin_panel")]]))
+        await message.answer(f"✅ Admin X {val}x ga o'zgartirildi!", reply_markup=main_menu(message.from_user.id))
     except ValueError:
-        await message.answer("❌ Faqat son kiriting!")
+        await message.answer("❌ Faqat raqam kiriting:")
+
+@dp.callback_query(F.data == "admin_add_coin")
+async def admin_add_coin(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id != ADMIN_ID: return
+    await state.set_state(AdminState.waiting_user_id)
+    await state.update_data(action="add")
+    await callback.message.edit_text("Foydalanuvchi Telegram ID raqamini yuboring:")
+
+@dp.callback_query(F.data == "admin_sub_coin")
+async def admin_sub_coin(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id != ADMIN_ID: return
+    await state.set_state(AdminState.waiting_user_id)
+    await state.update_data(action="sub")
+    await callback.message.edit_text("Foydalanuvchi Telegram ID raqamini yuboring:")
+
+@dp.message(AdminState.waiting_user_id)
+async def admin_get_uid(message: Message, state: FSMContext):
+    try:
+        uid = int(message.text)
+        await state.update_data(target_id=uid)
+        await state.set_state(AdminState.waiting_amount)
+        await message.answer("Qancha miqdorda coin bermoqchi/ayirmoqchisiz? Miqdorni kiriting:")
+    except ValueError:
+        await message.answer("❌ ID raqam bo'lishi kerak:")
+
+@dp.message(AdminState.waiting_amount)
+async def admin_process_amount(message: Message, state: FSMContext):
+    try:
+        amount = int(message.text)
+        data = await state.get_data()
+        uid = data.get("target_id")
+        action = data.get("action")
+        if action == "add":
+            await change_balance(uid, amount)
+            await message.answer(f"✅ {uid} ga {amount} coin qo'shildi!")
+        else:
+            await change_balance(uid, -amount)
+            await message.answer(f"✅ {uid} dan {amount} coin olib tashlandi!")
+        await state.clear()
+    except ValueError:
+        await message.answer("❌ Faqat raqam kiriting:")
+
+@dp.callback_query(F.data == "admin_broadcast")
+async def admin_broadcast_prompt(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id != ADMIN_ID: return
+    await state.set_state(AdminState.waiting_broadcast)
+    await callback.message.edit_text("📢 Barcha foydalanuvchilarga yuborish uchun xabar matnini kiriting:")
+
+@dp.message(AdminState.waiting_broadcast)
+async def admin_send_broadcast(message: Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID: return
+    text = message.text
+    await state.clear()
+    users = await asyncio.to_thread(db_query, "SELECT user_id FROM users", fetchall=True)
+    success = 0
+    for u in users:
+        try:
+            await bot.send_message(u[0], text, parse_mode=ParseMode.HTML)
+            success += 1
+            await asyncio.sleep(0.05)
+        except Exception:
+            pass
+    await message.answer(f"✅ Xabar {success} ta foydalanuvchiga muvaffaqiyatli yuborildi!")
 
 
 # =========================================================
-# 🚀 HAKIQIY SAYTGA O'XSHASH CRASH O'YINI MANTIQLARI
+# 🚀 CRASH AVTOMATIK FONI (2 marta admin X, keyin random, 5 soniya)
+# =========================================================
+async def start_crash_engine():
+    while True:
+        try:
+            mode = await get_setting("crash_mode")
+            admin_x = float(await get_setting("admin_multiplier") or 2.0)
+            streak = int(await get_setting("admin_streak") or 0)
+            
+            crash_at = 2.00
+            used_mode = ""
+
+            if mode == "admin":
+                crash_at = admin_x
+                used_mode = "Admin X"
+                streak += 1
+                await update_setting("admin_streak", str(streak))
+                
+                # 2 marta chiqqach randomga o'tamiz
+                if streak >= 2:
+                    await update_setting("crash_mode", "random")
+                    await update_setting("admin_streak", "0")
+            else:
+                users_count = await get_users_count()
+                base_rand = random.uniform(1.20, 5.00)
+                if users_count > 10:
+                    crash_at = round(base_rand * random.uniform(1.0, 1.4), 2)
+                else:
+                    crash_at = round(base_rand, 2)
+                used_mode = "Random X"
+                # Keyingi safar yana adminkaga qaytamiz
+                await update_setting("crash_mode", "admin")
+
+            # Bazaga yozish
+            await asyncio.to_thread(db_query, "INSERT INTO crash_history (multiplier, mode) VALUES (?, ?)", (crash_at, used_mode), commit=True)
+        except Exception as e:
+            logging.error(f"Crash engine xatoligi: {e}")
+
+        # Har bir yangi Crash 5 soniyadan keyin boshlanadi
+        await asyncio.sleep(5)
+
+
+# =========================================================
+# 🚀 CRASH O'YINI MANTIQLARI
 # =========================================================
 @dp.callback_query(F.data == "play_crash")
 async def play_crash_menu(callback: CallbackQuery, state: FSMContext):
     await state.set_state(CrashState.waiting_bet)
     balance = await get_balance(callback.from_user.id)
     await callback.message.edit_text(
-        f"🚀 <b>CRASH O'YINI (AVIATOR)</b>\n"
+        f"🚀 <b>CRASH O'YINI</b>\n"
         f"──────────────────────────\n"
+        f"📈 Raketa parvozini kuzating va portlashdan oldin pulni yechib oling!\n\n"
         f"💰 Balansingiz: <b>{money(balance)} coin</b>\n"
         f"Stavka miqdorini kiriting (min: 100 coin):",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Orqaga", callback_data="back_to_menu")]]),
@@ -459,147 +713,109 @@ async def process_crash_bet(message: Message, state: FSMContext):
     balance = await get_balance(user_id)
 
     if bet < 100 or bet > balance:
-        await message.answer("❌ Mablag' yetarli emas yoki stavka juda kam!")
+        await message.answer("❌ Noto'g'ri summa yoki balans yetarli emas!")
         return
 
     await change_balance(user_id, -bet)
     await state.clear()
 
-    CRASH_GAME["bets"][user_id] = {
-        "bet": bet,
-        "cashed": False,
-        "name": message.from_user.first_name
-    }
-
     game_msg = await message.answer(
-        f"🚀 <b>STAVKA QABUL QILINDI: {money(bet)} coin</b>\n"
-        f"⏳ Keyingi reys boshlanishini kuting...",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⏳ Kutilmoqda...", callback_data="none")]]),
+        f"🚀 <b>RAKETA PARVOZGA TAYYORLANMOQDA...</b>\n\n💰 Stavka: <b>{money(bet)} coin</b>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⏳ Tayyorlanmoqda...", callback_data="none")]]),
         parse_mode=ParseMode.HTML
     )
-    CRASH_GAME["message_ids"][user_id] = game_msg.message_id
-
-    if CRASH_GAME["status"] == "waiting":
-        asyncio.create_task(run_global_crash_flight())
-
-async def run_global_crash_flight():
-    CRASH_GAME["status"] = "waiting"
-    await asyncio.sleep(4)
-
-    CRASH_GAME["status"] = "flying"
-    CRASH_GAME["multiplier"] = 1.00
-    crash_at = TARGET_CRASH_X
-
-    admin_text = f"🎮 <b>YANGI REYS BOSHLANDI!</b>\nO'yinchilar soni: {len(CRASH_GAME['bets'])}\n\n"
-    for u_id, data in CRASH_GAME["bets"].items():
-        admin_text += f"👤 {data['name']} (ID: <code>{u_id}</code>) — {money(data['bet'])} coin\n"
     
-    admin_msg = await bot.send_message(chat_id=ADMIN_ID, text=admin_text, parse_mode=ParseMode.HTML)
+    # Hozirgi crash qiymatini bazadan olib o'yinga qo'shamiz
+    mode = await get_setting("crash_mode")
+    admin_x = float(await get_setting("admin_multiplier") or 2.0)
+    target_x = admin_x if mode == "admin" else round(random.uniform(1.2, 4.0), 2)
+    
+    asyncio.create_task(run_crash_flight(message.bot, user_id, bet, game_msg.message_id, target_x))
 
-    cash_out_kb = InlineKeyboardMarkup(
+async def run_crash_flight(bot_inst, user_id, bet, message_id, crash_at):
+    current_multiplier = 1.00
+    ACTIVE_GAMES[user_id] = {"bet": bet, "multiplier": 1.00, "status": "flying"}
+    
+    cash_out_keyboard = InlineKeyboardMarkup(
         inline_keyboard=[[InlineKeyboardButton(text="🎯 PULNI OLISH (CASH OUT)", callback_data="crash_cashout")]]
     )
 
     try:
-        while CRASH_GAME["multiplier"] < crash_at:
-            await asyncio.sleep(0.9)
-            CRASH_GAME["multiplier"] += 0.15
+        while current_multiplier < crash_at:
+            await asyncio.sleep(1.0)
+            current_multiplier += 0.20
             
-            if CRASH_GAME["multiplier"] >= crash_at:
-                CRASH_GAME["multiplier"] = crash_at
+            if current_multiplier >= crash_at:
+                current_multiplier = crash_at
 
-            curr_m = CRASH_GAME["multiplier"]
-            progress_val = min(int((curr_m - 1.0) * 3), 10)
-            bar = "🟩" * progress_val + "⬛" * (10 - progress_val)
+            if user_id not in ACTIVE_GAMES or ACTIVE_GAMES[user_id].get("status") != "flying":
+                return
 
-            for u_id, m_id in list(CRASH_GAME["message_ids"].items()):
-                if u_id in CRASH_GAME["bets"] and not CRASH_GAME["bets"][u_id]["cashed"]:
-                    bet_val = CRASH_GAME["bets"][u_id]["bet"]
-                    try:
-                        await bot.edit_message_text(
-                            chat_id=u_id,
-                            message_id=m_id,
-                            text=f"🚀 <b>RAKETA UCHMOQDA!</b>\n"
-                                 f"──────────────────────────\n"
-                                 f"       📈 <b>{curr_m:.2f}x</b>\n"
-                                 f"──────────────────────────\n"
-                                 f"📊 Grafik: [{bar}]\n"
-                                 f"💰 Stavka: {money(bet_val)} coin\n"
-                                 f"🎁 Hozirgi yutuq: <b>{money(int(bet_val * curr_m))} coin</b>\n"
-                                 f"──────────────────────────\n"
-                                 f"👥 <i>O'yinda {len(CRASH_GAME['bets'])} ta ishtirokchi bor</i>",
-                            reply_markup=cash_out_kb,
-                            parse_mode=ParseMode.HTML
-                        )
-                    except Exception:
-                        pass
+            ACTIVE_GAMES[user_id]["multiplier"] = current_multiplier
+            progress_val = min(int((current_multiplier - 1.0) * 2), 10)
+            bar = "🟩" * progress_val + "⬜" * (10 - progress_val)
 
-        CRASH_GAME["status"] = "crashed"
-        
-        for u_id, m_id in list(CRASH_GAME["message_ids"].items()):
-            if u_id in CRASH_GAME["bets"] and not CRASH_GAME["bets"][u_id]["cashed"]:
-                bet_val = CRASH_GAME["bets"][u_id]["bet"]
-                try:
-                    await bot.edit_message_text(
-                        chat_id=u_id,
-                        message_id=m_id,
-                        text=f"💥 <b>BOOOOOOOM! RAKETA PORTLADI!</b>\n"
-                             f"──────────────────────────\n"
-                             f"📍 Portlash nuqtasi: <b>{crash_at:.2f}x</b>\n"
-                             f"❌ <b>Afsus, vaqtida ulgurmadingiz va yutqazdingiz!</b>\n"
-                             f"💰 Yo'qotildi: <b>-{money(bet_val)} coin</b>\n"
-                             f"──────────────────────────",
-                        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-                            InlineKeyboardButton(text="🔄 Qaytadan O'ynash", callback_data="play_crash"),
-                            InlineKeyboardButton(text="🏠 Asosiy Menyu", callback_data="back_to_menu")
-                        ]]),
-                        parse_mode=ParseMode.HTML
-                    )
-                except Exception:
-                    pass
+            try:
+                await bot_inst.edit_message_text(
+                    chat_id=user_id,
+                    message_id=message_id,
+                    text=f"🚀 <b>CRASH — RAKETA UCHMOQDA!</b>\n"
+                         f"──────────────────────────\n"
+                         f"      🚀 <b>{current_multiplier:.2f}x</b>\n"
+                         f"──────────────────────────\n"
+                         f"📊 <b>Balandlik:</b> [{bar}]\n"
+                         f"💰 <b>Stavka:</b> {money(bet)} coin\n"
+                         f"⚡️ <i>Portlab ketishidan oldin pulni olib qoling!</i>",
+                    reply_markup=cash_out_keyboard,
+                    parse_mode=ParseMode.HTML
+                )
+            except Exception:
+                pass
 
-        CRASH_GAME["bets"].clear()
-        CRASH_GAME["message_ids"].clear()
-        CRASH_GAME["status"] = "waiting"
-        try:
-            await bot.delete_message(chat_id=ADMIN_ID, message_id=admin_msg.message_id)
-        except Exception:
-            pass
-
+        if user_id in ACTIVE_GAMES and ACTIVE_GAMES[user_id]["status"] == "flying":
+            ACTIVE_GAMES[user_id]["status"] = "crashed"
+            await bot_inst.edit_message_text(
+                chat_id=user_id,
+                message_id=message_id,
+                text=f"💥 <b>BOOOOOOOM! RAKETA PORTLADI!</b>\n"
+                     f"──────────────────────────\n"
+                     f"📍 Portlash: <b>{crash_at:.2f}x</b>\n"
+                     f"❌ <b>Afsus, siz yutqazdingiz!</b>\n"
+                     f"💰 Yo'qotildi: <b>-{money(bet)} coin</b>",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                    InlineKeyboardButton(text="🔄 Qaytadan O'ynash", callback_data="play_crash"),
+                    InlineKeyboardButton(text="🏠 Asosiy Menyu", callback_data="back_to_menu")
+                ]]),
+                parse_mode=ParseMode.HTML
+            )
+            del ACTIVE_GAMES[user_id]
     except Exception as e:
-        logging.error(f"Global Crash xatolik: {e}")
-        CRASH_GAME["status"] = "waiting"
-        CRASH_GAME["bets"].clear()
-        CRASH_GAME["message_ids"].clear()
+        logging.error(f"Crash xatoligi: {e}")
 
 @dp.callback_query(F.data == "crash_cashout")
 async def process_crash_cashout(callback: CallbackQuery):
     user_id = callback.from_user.id
-    
-    if CRASH_GAME["status"] != "flying" or user_id not in CRASH_GAME["bets"] or CRASH_GAME["bets"][user_id]["cashed"]:
-        await callback.answer("⚠️ Kechikdingiz yoki o'yin tugagan!", show_alert=True)
+    if user_id not in ACTIVE_GAMES or ACTIVE_GAMES[user_id]["status"] != "flying":
+        await callback.answer("⚠️ O'yin tugagan yoki kechikdingiz!", show_alert=True)
         return
 
-    player = CRASH_GAME["bets"][user_id]
-    player["cashed"] = True
-    
-    multiplier = CRASH_GAME["multiplier"]
-    win_amount = int(player["bet"] * multiplier)
+    game = ACTIVE_GAMES[user_id]
+    game["status"] = "cashed_out"
+    win_amount = int(game["bet"] * game["multiplier"])
     await change_balance(user_id, win_amount)
 
     await callback.message.edit_text(
-        f"🎉 <b>TABRIKLAYMIZ! PUL MUVAFFAQIYATLI OLINDI!</b>\n"
+        f"🎉 <b>TABRIKLAYMIZ! PULNI MUVAFFAQIYATLI OLDINGIZ!</b>\n"
         f"──────────────────────────\n"
-        f"📈 Koeffitsiyent: <b>{multiplier:.2f}x</b>\n"
-        f"💰 Yutuq: <b>+{money(win_amount)} coin</b>\n"
-        f"──────────────────────────",
+        f"📈 Koeffitsiyent: <b>{game['multiplier']:.2f}x</b>\n"
+        f"💰 Yutuq: <b>+{money(win_amount)} coin</b>",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(text="🔄 Qaytadan O'ynash", callback_data="play_crash"),
             InlineKeyboardButton(text="🏠 Asosiy Menyu", callback_data="back_to_menu")
         ]]),
         parse_mode=ParseMode.HTML
     )
-    await callback.answer(f"+{money(win_amount)} coin yutiboldingiz!", show_alert=True)
+    del ACTIVE_GAMES[user_id]
 
 
 # =========================================================
@@ -608,6 +824,7 @@ async def process_crash_cashout(callback: CallbackQuery):
 async def main():
     logging.basicConfig(level=logging.INFO)
     await init_db()
+    asyncio.create_task(start_crash_engine()) # Fon rejimdagi crash siklini qo'shamiz
     await dp.start_polling(bot)
 
 if __name__ == "__main__":

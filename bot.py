@@ -1,10 +1,11 @@
-import asyncio                                        
+import asyncio
 import logging
 import os
 import sqlite3
 import time
 from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ParseMode
+from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
@@ -15,11 +16,13 @@ DB_NAME = "crash_bot.db"
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
+
 # Mines o'yinining statistikasini saqlash uchun
 user_game_steps = {}
 user_total_games = {}
 TARGET_CRASH_X = 2.00
 ACTIVE_GAMES = {}
+
 def get_mines_keyboard():
     keyboard = []
     for r in range(3):
@@ -49,7 +52,8 @@ async def start_mines(message: Message):
         reply_markup=get_mines_keyboard(),
         parse_mode=ParseMode.MARKDOWN
     )
-    @dp.callback_query(F.data.startswith("mine_"))
+
+@dp.callback_query(F.data.startswith("mine_"))
 async def process_mine_click(callback: CallbackQuery):
     user_id = callback.from_user.id
     
@@ -122,7 +126,6 @@ async def init_db():
         )''',
         commit=True
     )
-    # Agar jadval ilgaridan mavjud bo'lsa, yangi ustunni qo'shish
     try:
         await asyncio.to_thread(
             db_query,
@@ -194,7 +197,6 @@ async def get_users_count() -> int:
 def money(val: int) -> str:
     return f"{val:,}".replace(",", " ")
 
-
 # =========================================================
 # FSM HOLATLARI
 # =========================================================
@@ -213,7 +215,6 @@ class WithdrawState(StatesGroup):
     waiting_amount = State()
     waiting_card_and_name = State()
 
-
 # =========================================================
 # KLAVIATURALAR
 # =========================================================
@@ -230,7 +231,6 @@ def main_menu(user_id: int):
     if user_id == ADMIN_ID:
         kb.append([InlineKeyboardButton(text="👨‍💼 Admin Panel", callback_data="admin_panel")])
     return InlineKeyboardMarkup(inline_keyboard=kb)
-
 
 # =========================================================
 # START VA ASOSIY MENYU
@@ -268,15 +268,13 @@ async def my_balance_handler(callback: CallbackQuery):
     balance = await get_balance(callback.from_user.id)
     await callback.answer(f"💰 Balansingiz: {money(balance)} coin", show_alert=True)
 
-
 # =========================================================
-# ⛏ MINING BO'LIMI (1 DEPOZIT TALAB QILINADI)
+# ⛏ MINING BO'LIMI
 # =========================================================
 @dp.callback_query(F.data == "mining_section")
 async def mining_handler(callback: CallbackQuery):
     user_id = callback.from_user.id
 
-    # 1. Depozit qilganlik holatini tekshiramiz
     is_deposited = await check_user_deposited(user_id)
     if not is_deposited:
         kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -293,11 +291,10 @@ async def mining_handler(callback: CallbackQuery):
         )
         return
 
-    # 2. Agar depozit qilgan bo'lsa, mining mantiqi ishlaydi
     current_time = int(time.time())
     last_claim = await get_last_claim(user_id)
     
-    cooldown = 3600  # 1 soat = 3600 soniya
+    cooldown = 3600
     elapsed = current_time - last_claim
 
     if elapsed >= cooldown:
@@ -337,7 +334,6 @@ async def mining_handler(callback: CallbackQuery):
 async def claim_mining_handler(callback: CallbackQuery):
     user_id = callback.from_user.id
     
-    # Qayta depozit tekshiruvi
     if not await check_user_deposited(user_id):
         await callback.answer("⚠️ Avval depozit qilishingiz kerak!", show_alert=True)
         return
@@ -372,9 +368,8 @@ async def claim_mining_handler(callback: CallbackQuery):
         parse_mode=ParseMode.HTML
     )
 
-
 # =========================================================
-# 📥 DEPOZIT (PUL KIRITISH) TIZIMI
+# 📥 DEPOZIT TIZIMI
 # =========================================================
 @dp.callback_query(F.data == "deposit_money")
 async def deposit_start(callback: CallbackQuery, state: FSMContext):
@@ -465,7 +460,6 @@ async def deposit_proof_process(message: Message, state: FSMContext):
         reply_markup=main_menu(user_id),
         parse_mode=ParseMode.HTML
     )
-
 
 # =========================================================
 # 📤 PUL CHIQARISH TIZIMI
@@ -565,16 +559,14 @@ async def withdraw_card_process(message: Message, state: FSMContext):
         parse_mode=ParseMode.HTML
     )
 
-
 # =========================================================
-# 👨‍💼 ADMIN TASDIQLASH/RAD ETISH HANDLERLARI
+# 👨‍💼 ADMIN HANDLERLARI
 # =========================================================
 @dp.callback_query(F.data.startswith("dep_app:"))
 async def approve_deposit(callback: CallbackQuery):
     _, u_id, amt = callback.data.split(":")
     user_id, amount = int(u_id), int(amt)
 
-    # Balansni oshiramiz va mining ruxsatini beramiz
     await change_balance(user_id, amount)
     await set_user_deposited(user_id)
 
@@ -631,10 +623,6 @@ async def reject_withdraw(callback: CallbackQuery):
         parse_mode=ParseMode.HTML
     )
 
-
-# =========================================================
-# ADMIN PANEL VA CRASH X
-# =========================================================
 @dp.callback_query(F.data == "admin_panel")
 async def admin_panel_handler(callback: CallbackQuery, state: FSMContext):
     if callback.from_user.id != ADMIN_ID:
@@ -719,7 +707,6 @@ async def process_set_crash_x(message: Message, state: FSMContext):
     except ValueError:
         await message.answer("❌ Noto'g'ri format! Faqat son kiriting (masalan: 2.5):")
 
-
 # =========================================================
 # 🚀 CRASH O'YINI MANTIQLARI
 # =========================================================
@@ -794,7 +781,7 @@ async def run_crash_flight(bot_inst, user_id, bet, message_id):
                     message_id=message_id,
                     text=f"🚀 <b>CRASH — RAKETA UCHMOQDA!</b>\n"
                          f"──────────────────────────\n"
-                         f"      🚀 <b>{current_multiplier:.2f}x</b>\n"
+                         f"     🚀 <b>{current_multiplier:.2f}x</b>\n"
                          f"──────────────────────────\n"
                          f"📊 <b>Balandlik:</b> [{bar}]\n"
                          f"💰 <b>Stavka:</b> {money(bet)} coin\n"
@@ -812,50 +799,42 @@ async def run_crash_flight(bot_inst, user_id, bet, message_id):
             await bot_inst.edit_message_text(
                 chat_id=user_id,
                 message_id=message_id,
-                text=f"💥 <b>BOOOOOOOM! RAKETA PORTLADI!</b>\n"
-                     f"──────────────────────────\n"
-                     f"📍 Portlash koeffitsiyenti: <b>{crash_at:.2f}x</b>\n"
-                     f"❌ <b>Afsus, siz yutqazdingiz!</b>\n"
-                     f"💰 Yo'qotildi: <b>-{money(bet)} coin</b>\n"
-                     f"──────────────────────────",
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-                    InlineKeyboardButton(text="🔄 Qaytadan O'ynash", callback_data="play_crash"),
-                    InlineKeyboardButton(text="🏠 Asosiy Menyu", callback_data="back_to_menu")
-                ]]),
+                text=f"💥 <b>BOOOOOOOM! Raketa portlab ketdi! ({crash_at:.2f}x)</b>\n\n"
+                     f"❌ Afsuski, vaqtida ulgurmadingiz va stavkangiz kuydi.",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🏠 Asosiy Menyu", callback_data="back_to_menu")]]),
                 parse_mode=ParseMode.HTML
             )
-            del ACTIVE_GAMES[user_id]
-
+            ACTIVE_GAMES.pop(user_id, None)
     except Exception as e:
-        logging.error(f"Crash o'yinida xatolik: {e}")
+        logging.error(f"Crash error: {e}")
 
 @dp.callback_query(F.data == "crash_cashout")
-async def process_crash_cashout(callback: CallbackQuery):
+async def crash_cashout_handler(callback: CallbackQuery):
     user_id = callback.from_user.id
     if user_id not in ACTIVE_GAMES or ACTIVE_GAMES[user_id]["status"] != "flying":
-        await callback.answer("⚠️ O'yin tugagan yoki kechikdingiz!", show_alert=True)
+        await callback.answer("⚠️ Faol o'yin topilmadi yoki raketa allaqachon portlagan!", show_alert=True)
         return
 
     game = ACTIVE_GAMES[user_id]
     game["status"] = "cashed_out"
     
-    win_amount = int(game["bet"] * game["multiplier"])
+    bet = game["bet"]
+    multiplier = game["multiplier"]
+    win_amount = int(bet * multiplier)
+
     await change_balance(user_id, win_amount)
+    ACTIVE_GAMES.pop(user_id, None)
 
     await callback.message.edit_text(
-        f"🎉 <b>TABRIKLAYMIZ! PULNI MUVAFFAQIYATLI OLDINGIZ!</b>\n"
+        f"🎉 <b>TABRIKLAYMIZ! MUVAFFAQIYATLI PULNI YECHDINGIZ!</b>\n"
         f"──────────────────────────\n"
-        f"📈 Ushlangan koeffitsiyent: <b>{game['multiplier']:.2f}x</b>\n"
-        f"💰 Umumiy yutuq: <b>+{money(win_amount)} coin</b>\n"
+        f"💰 Stavka: <b>{money(bet)} coin</b>\n"
+        f"📈 Koeffitsiyent: <b>{multiplier:.2f}x</b>\n"
+        f"🏆 Yutuq: <b>+{money(win_amount)} coin</b>\n"
         f"──────────────────────────",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="🔄 Qaytadan O'ynash", callback_data="play_crash"),
-            InlineKeyboardButton(text="🏠 Asosiy Menyu", callback_data="back_to_menu")
-        ]]),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🏠 Asosiy Menyu", callback_data="back_to_menu")]]),
         parse_mode=ParseMode.HTML
     )
-    del ACTIVE_GAMES[user_id]
-
 
 # =========================================================
 # BOTNI ISHGA TUSHIRISH
@@ -863,6 +842,7 @@ async def process_crash_cashout(callback: CallbackQuery):
 async def main():
     logging.basicConfig(level=logging.INFO)
     await init_db()
+    print("Bot ishga tushdi...")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":

@@ -17,12 +17,14 @@ DB_NAME = "crash_bot.db"
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
+# Faol o'yinlar va stavka qabul qilish holati
 ACTIVE_GAMES = {}
+BETTING_OPEN = False
+CURRENT_ROUND_ID = 0
 
 # =========================================================
 # MA'LUMOTLAR BAZASI FUNKSIYALARI
 # =========================================================
-# Baza bandligining (database locked) oldini olish uchun timeout=30 qo'shildi
 def db_query(query: str, params: tuple = (), fetchone: bool = False, fetchall: bool = False, commit: bool = False):
     conn = sqlite3.connect(DB_NAME, timeout=30) 
     cursor = conn.cursor()
@@ -320,7 +322,7 @@ async def claim_mining_handler(callback: CallbackQuery):
     )
 
 # =========================================================
-# 📥 DEPOZIT VA 📤 PUL CHIQARISH TIZIMLARI
+# 📥 DEPOZIT VA 📤 PUL CHIQARish TIZIMLARI
 # =========================================================
 @dp.callback_query(F.data == "deposit_money")
 async def deposit_start(callback: CallbackQuery, state: FSMContext):
@@ -595,8 +597,9 @@ async def process_set_crash_x(message: Message, state: FSMContext):
     try:
         val = float(message.text.replace(",", "."))
         await update_setting("admin_multiplier", str(val))
+        await update_setting("crash_mode", "admin") # Admin kiritganda rejim admin bo'ladi
         await state.clear()
-        await message.answer(f"✅ Admin X {val}x ga o'zgartirildi!", reply_markup=main_menu(message.from_user.id))
+        await message.answer(f"✅ Admin X {val}x ga o'zgartirildi va rejim o'rnatildi!", reply_markup=main_menu(message.from_user.id))
     except ValueError:
         await message.answer("❌ Faqat raqam kiriting:")
 
@@ -664,11 +667,23 @@ async def admin_send_broadcast(message: Message, state: FSMContext):
     await message.answer(f"✅ Xabar {success} ta foydalanuvchiga muvaffaqiyatli yuborildi!")
 
 # =========================================================
-# 🚀 CRASH AVTOMATIK FONI
+# 🚀 CRASH AVTOMATIK FONI VA TESKARI SANOQ MANTIQI
 # =========================================================
 async def start_crash_engine():
+    global BETTING_OPEN, CURRENT_ROUND_ID
     while True:
         try:
+            CURRENT_ROUND_ID += 1
+            
+            # 8 soniya teskari sanoq va stavka qabul qilish boshlanadi
+            BETTING_OPEN = True
+            for remaining in range(8, 0, -1):
+                # Bu yerda istasangiz barcha foydalanuvchilarga vaqtni yuborishingiz yoki statusni saqlashingiz mumkin
+                await asyncio.sleep(1)
+            
+            # Stavka qabul qilish yopiladi
+            BETTING_OPEN = False
+
             mode = await get_setting("crash_mode")
             admin_x = float(await get_setting("admin_multiplier") or 2.0)
             streak = int(await get_setting("admin_streak") or 0)
@@ -676,42 +691,47 @@ async def start_crash_engine():
             crash_at = 2.00
             used_mode = ""
 
+            # Shart: Agar admin x bergan bo'lsa o'sha ishlaydi, bermasa Random (1.00 dan 1.90 gacha)
             if mode == "admin":
                 crash_at = admin_x
                 used_mode = "Admin X"
                 streak += 1
                 await update_setting("admin_streak", str(streak))
                 
-                if streak >= 2:
+                # 1 marta ishlatilgach random rejimga o'tishi uchun (yoki admin o'zgartirguncha)
+                if streak >= 1:
                     await update_setting("crash_mode", "random")
                     await update_setting("admin_streak", "0")
             else:
-                users_count = await get_users_count()
-                base_rand = random.uniform(1.20, 5.00)
-                if users_count > 10:
-                    crash_at = round(base_rand * random.uniform(1.0, 1.4), 2)
-                else:
-                    crash_at = round(base_rand, 2)
+                # Random 1.00 dan 1.90 gacha (1.00 da ham uchib turishi mumkin)
+                crash_at = round(random.uniform(1.00, 1.90), 2)
                 used_mode = "Random X"
-                await update_setting("crash_mode", "admin")
 
             await asyncio.to_thread(db_query, "INSERT INTO crash_history (multiplier, mode) VALUES (?, ?)", (crash_at, used_mode), commit=True)
+            
+            # O'yin parvozi tugaguncha kutamiz (masalan, parvoz vaqti)
+            await asyncio.sleep(6)
+            
         except Exception as e:
             logging.error(f"Crash engine xatoligi: {e}")
-
-        await asyncio.sleep(5)
+            await asyncio.sleep(3)
 
 # =========================================================
 # 🚀 CRASH O'YINI MANTIQLARI VA PARVOZ
 # =========================================================
 @dp.callback_query(F.data == "play_crash")
 async def play_crash_menu(callback: CallbackQuery, state: FSMContext):
+    global BETTING_OPEN
+    if not BETTING_OPEN:
+        await callback.answer("⏳ Hozir stavka qabul qilish vaqti tugagan! O'yin tugagandan keyin stavka qilishingiz mumkin.", show_alert=True)
+        return
+
     await state.set_state(CrashState.waiting_bet)
     balance = await get_balance(callback.from_user.id)
     await callback.message.edit_text(
-        f"🚀 <b>CRASH O'YINI</b>\n"
+        f"🚀 <b>CRASH O'YINI (STAVKA QILISH)</b>\n"
         f"──────────────────────────\n"
-        f"📈 Raketa parvozini kuzating va portlashdan oldin pulni yechib oling!\n\n"
+        f"⏳ Stavka qilish uchun 8 soniyalik vaqt berilgan!\n\n"
         f"💰 Balansingiz: <b>{fn(balance)} coin</b>\n"
         f"Stavka miqdorini kiriting (min: 100 coin):",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Orqaga", callback_data="back_to_menu")]]),
@@ -720,146 +740,174 @@ async def play_crash_menu(callback: CallbackQuery, state: FSMContext):
 
 @dp.message(CrashState.waiting_bet)
 async def process_crash_bet(message: Message, state: FSMContext):
+    global BETTING_OPEN
+    if not BETTING_OPEN:
+        await message.answer("❌ Kechikdingiz! Stavka qabul qilish vaqti tugadi. O'yin tugagandan keyin qayta urinib ko'ring.", reply_markup=main_menu(message.from_user.id))
+        await state.clear()
+        return
+
     if not message.text or not message.text.isdigit():
         await message.answer("❌ Faqat raqam kiriting:")
         return
 
-    bet = int(message.text)
+    bet_amount = int(message.text)
     user_id = message.from_user.id
     balance = await get_balance(user_id)
 
-    if bet < 100:
+    if bet_amount < 100:
         await message.answer("❌ Minimal stavka 100 coin!")
         return
-    if bet > balance:
-        await message.answer("❌ Balansingizda yetarli coin yo'q!")
+
+    if bet_amount > balance:
+        await message.answer("❌ Balansingizda yetarli mablag' yo'q!")
         return
 
-    await change_balance(user_id, -bet)
+    # Stavkani yechib olamiz
+    await change_balance(user_id, -bet_amount)
     await state.clear()
 
-    msg = await message.answer(
-        f"🚀 <b>Raketa uchmoqda...</b>\n\n"
-        f"📊 Koeffitsiyent: <b>1.00x</b>\n"
-        f"💰 Stavka: <b>{fn(bet)} coin</b>",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🛑 Yechib olish (Cashout)", callback_data=f"cashout:{user_id}:{bet}")]
-        ]),
-        parse_mode=ParseMode.HTML
-    )
-
-    ACTIVE_GAMES[user_id] = {
-        "msg_id": msg.message_id,
-        "chat_id": message.chat.id,
-        "bet": bet,
-        "cashed_out": False,
-        "current_x": 1.00
-    }
-
-    last_crash = await asyncio.to_thread(
+    # So'nggi crash natijasini olib kelamiz
+    last_row = await asyncio.to_thread(
         db_query, 
         "SELECT multiplier FROM crash_history ORDER BY id DESC LIMIT 1", 
         fetchone=True
     )
-    crash_point = last_crash[0] if last_crash else 2.00
+    crash_target = last_row[0] if last_row else 1.50
 
-    current_x = 1.00
-    while current_x < crash_point:
+    # O'yin holati
+    current_multiplier = 1.00
+    is_cashed_out = False
+
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="💰 Pulni olish", callback_data="cash_out")]
+        ]
+    )
+
+    # O'yin seansini saqlaymiz
+    ACTIVE_GAMES[user_id] = {
+        "bet": bet_amount,
+        "multiplier": current_multiplier,
+        "target": crash_target,
+        "cashed": False
+    }
+
+    msg = await message.answer(
+        f"🚀 <b>RAKETA PARVOZ QILMOQDA...</b>\n\n"
+        f"📈 Multiplier: <b>{current_multiplier:.2f}x</b>\n"
+        f"💵 Stavka: <b>{fn(bet_amount)} coin</b>",
+        reply_markup=kb,
+        parse_mode=ParseMode.HTML
+    )
+
+    ACTIVE_GAMES[user_id]["msg_id"] = msg.message_id
+
+    # Parvoz tsikli
+    while current_multiplier < crash_target:
         await asyncio.sleep(0.6)
         
-        if user_id not in ACTIVE_GAMES or ACTIVE_GAMES[user_id].get("cashed_out"):
-            return
-
-        current_x = round(current_x + random.uniform(0.05, 0.15), 2)
-        if current_x >= crash_point:
-            current_x = crash_point
+        if user_id not in ACTIVE_GAMES:
+            break
+            
+        if ACTIVE_GAMES[user_id]["cashed"]:
             break
 
-        ACTIVE_GAMES[user_id]["current_x"] = current_x
+        # Multiplierni oshiramiz
+        increment = round(random.uniform(0.02, 0.08), 2)
+        current_multiplier = round(current_multiplier + increment, 2)
+        
+        if current_multiplier >= crash_target:
+            current_multiplier = crash_target
+            break
+
+        ACTIVE_GAMES[user_id]["multiplier"] = current_multiplier
 
         try:
             await bot.edit_message_text(
-                chat_id=message.chat.id,
+                chat_id=user_id,
                 message_id=msg.message_id,
-                text=f"🚀 <b>Raketa uchmoqda...</b>\n\n"
-                     f"📊 Koeffitsiyent: <b>{current_x:.2f}x</b>\n"
-                     f"💰 Stavka: <b>{fn(bet)} coin</b>",
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                    [InlineKeyboardButton(text="🛑 Yechib olish (Cashout)", callback_data=f"cashout:{user_id}:{bet}")]
-                ]),
+                text=f"🚀 <b>RAKETA PARVOZ QILMOQDA...</b>\n\n"
+                f"📈 Multiplier: <b>{current_multiplier:.2f}x</b>\n"
+                f"💵 Stavka: <b>{fn(bet_amount)} coin</b>",
+                reply_markup=kb,
                 parse_mode=ParseMode.HTML
             )
         except Exception:
             pass
 
-    if user_id in ACTIVE_GAMES and not ACTIVE_GAMES[user_id].get("cashed_out"):
+    # Crash sodir bo'ldi yoki o'yin yakunlandi
+    game_data = ACTIVE_GAMES.get(user_id)
+    if game_data and not game_data["cashed"]:
         ACTIVE_GAMES.pop(user_id, None)
         try:
             await bot.edit_message_text(
-                chat_id=message.chat.id,
+                chat_id=user_id,
                 message_id=msg.message_id,
-                text=f"💥 <b>KRASH! Raketa portladi!</b>\n\n"
-                     f"❌ To'xtagan nuqta: <b>{crash_point}x</b>\n"
-                     f"💸 Afsuski, {fn(bet)} coin yutqazdingiz.",
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                    [InlineKeyboardButton(text="🔄 Qayta o'ynash", callback_data="play_crash")],
-                    [InlineKeyboardButton(text="🏠 Asosiy Menyu", callback_data="back_to_menu")]
-                ]),
+                text=f"💥 <b>CRASH! RAKETA PORTLADI!</b>\n\n"
+                f"📉 To'xtagan nuqta: <b>{crash_target:.2f}x</b>\n"
+                f"❌ Afsuski, stavkangiz yondi: <b>{fn(bet_amount)} coin</b>\n\n"
+                f"ℹ️ <i>O'yin tugadi. Endi yangi raundda stavka qilishingiz mumkin!</i>",
+                reply_markup=InlineKeyboardMarkup(
+                    inline_keyboard=[
+                        [InlineKeyboardButton(text="🔄 Qaytadan o'ynash", callback_data="play_crash")],
+                        [InlineKeyboardButton(text="🏠 Asosiy menyu", callback_data="back_to_menu")]
+                    ]
+                ),
                 parse_mode=ParseMode.HTML
             )
         except Exception:
             pass
 
-# =========================================================
-# 🛑 CASHOUT (Pulni o'z vaqtida yechib olish)
-# =========================================================
-@dp.callback_query(F.data.startswith("cashout:"))
-async def cashout_handler(callback: CallbackQuery):
-    data_parts = callback.data.split(":")
-    u_id = int(data_parts[1])
-    bet = int(data_parts[2])
-
-    if callback.from_user.id != u_id:
-        await callback.answer("❌ Bu sizning o'yiningiz emas!", show_alert=True)
+@dp.callback_query(F.data == "cash_out")
+async def cash_out_handler(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    if user_id not in ACTIVE_GAMES:
+        await callback.answer("⚠️ Faol o'yin topilmadi!", show_alert=True)
         return
 
-    if u_id not in ACTIVE_GAMES or ACTIVE_GAMES[u_id].get("cashed_out"):
-        await callback.answer("❌ Kechikdingiz yoki o'yin tugagan!", show_alert=True)
+    game = ACTIVE_GAMES[user_id]
+    if game["cashed"]:
+        await callback.answer("⚠️ Pul allaqachon yechib olingan!", show_alert=True)
         return
 
-    game = ACTIVE_GAMES[u_id]
-    game["cashed_out"] = True
-    current_x = game["current_x"]
+    game["cashed"] = True
+    multiplier = game["multiplier"]
+    bet = game["bet"]
+    winnings = int(bet * multiplier)
 
-    winnings = int(bet * current_x)
-    await change_balance(u_id, winnings)
-    ACTIVE_GAMES.pop(u_id, None)
+    await change_balance(user_id, winnings)
+    ACTIVE_GAMES.pop(user_id, None)
 
     try:
         await callback.message.edit_text(
             f"✅ <b>MUVAFFAQIYATLI YECHIB OLINDI!</b>\n\n"
-            f"📈 Koeffitsiyent: <b>{current_x:.2f}x</b>\n"
-            f"🎉 Yutuq: <b>+{fn(winnings)} coin</b>",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="🚀 Qayta o'ynash", callback_data="play_crash")],
-                [InlineKeyboardButton(text="🏠 Asosiy Menyu", callback_data="back_to_menu")]
-            ]),
+            f"📈 Multiplier: <b>{multiplier:.2f}x</b>\n"
+            f"💰 Yutuq: <b>+{fn(winnings)} coin</b>\n\n"
+            f"ℹ️ <i>O'yin tugadi. Endi yangi raundda stavka qilishingiz mumkin!</i>",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text="🚀 Yana o'ynash", callback_data="play_crash")],
+                    [InlineKeyboardButton(text="🏠 Asosiy menyu", callback_data="back_to_menu")]
+                ]
+            ),
             parse_mode=ParseMode.HTML
         )
     except Exception:
         pass
-    await callback.answer(f"Tabriklaymiz! {fn(winnings)} coin yutib oldingiz!")
+    await callback.answer(f"🎉 Tabriklaymiz! +{fn(winnings)} coin yutib oldingiz!", show_alert=True)
+
 
 # =========================================================
-# BOTNI ISHGA TUSHIRISH (MAIN)
+# BOTNI ISHGA TUSHIRISH
 # =========================================================
 async def main():
     logging.basicConfig(level=logging.INFO)
     await init_db()
     
+    # Crash avtomatik dvigatelini fonda ishga tushiramiz
     asyncio.create_task(start_crash_engine())
-
-    print("🤖 Bot muvaffaqiyatli ishga tushdi!")
+    
+    print("Bot muvaffaqiyatli ishga tushdi!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":

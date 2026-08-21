@@ -1,9 +1,8 @@
 import asyncio
 import logging
-import os
-import sqlite3
 import random
 import time
+import aiosqlite
 from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ParseMode
 from aiogram.fsm.context import FSMContext
@@ -23,70 +22,59 @@ BETTING_OPEN = False
 CURRENT_ROUND_ID = 0
 
 # =========================================================
-# MA'LUMOTLAR BAZASI FUNKSIYALARI
+# ASINXRON MA'LUMOTLAR BAZASI FUNKSIYALARI (1000+ KISHI UCHUN)
 # =========================================================
-def db_query(query: str, params: tuple = (), fetchone: bool = False, fetchall: bool = False, commit: bool = False):
-    conn = sqlite3.connect(DB_NAME, timeout=30) 
-    cursor = conn.cursor()
-    cursor.execute(query, params)
-    result = None
-    if fetchone:
-        result = cursor.fetchone()
-    elif fetchall:
-        result = cursor.fetchall()
-    if commit:
-        conn.commit()
-    conn.close()
-    return result
+async def db_execute(query: str, params: tuple = ()):
+    async with aiosqlite.connect(DB_NAME, timeout=30) as db:
+        await db.execute(query, params)
+        await db.commit()
+
+async def db_fetch(query: str, params: tuple = (), fetchone: bool = False):
+    async with aiosqlite.connect(DB_NAME, timeout=30) as db:
+        async with db.execute(query, params) as cursor:
+            if fetchone:
+                return await cursor.fetchone()
+            return await cursor.fetchall()
 
 async def init_db():
-    await asyncio.to_thread(
-        db_query,
+    await db_execute(
         '''CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
             username TEXT,
             balance INTEGER DEFAULT 0,
             has_deposited INTEGER DEFAULT 0
-        )''',
-        commit=True
+        )'''
     )
     try:
-        await asyncio.to_thread(db_query, '''ALTER TABLE users ADD COLUMN has_deposited INTEGER DEFAULT 0''', commit=True)
+        await db_execute('''ALTER TABLE users ADD COLUMN has_deposited INTEGER DEFAULT 0''')
     except Exception:
         pass
     try:
-        await asyncio.to_thread(db_query, '''ALTER TABLE users ADD COLUMN username TEXT''', commit=True)
+        await db_execute('''ALTER TABLE users ADD COLUMN username TEXT''')
     except Exception:
         pass
 
-    await asyncio.to_thread(
-        db_query,
+    await db_execute(
         '''CREATE TABLE IF NOT EXISTS mining (
             user_id INTEGER PRIMARY KEY,
             last_claim INTEGER DEFAULT 0
-        )''',
-        commit=True
+        )'''
     )
-    await asyncio.to_thread(
-        db_query,
+    await db_execute(
         '''CREATE TABLE IF NOT EXISTS settings (
             key TEXT PRIMARY KEY,
             value TEXT
-        )''',
-        commit=True
+        )'''
     )
-    await asyncio.to_thread(
-        db_query,
+    await db_execute(
         '''CREATE TABLE IF NOT EXISTS crash_history (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             multiplier REAL,
             mode TEXT,
             timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-        )''',
-        commit=True
+        )'''
     )
-    await asyncio.to_thread(
-        db_query,
+    await db_execute(
         '''CREATE TABLE IF NOT EXISTS transactions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER,
@@ -94,32 +82,31 @@ async def init_db():
             amount REAL,
             status TEXT DEFAULT 'Kutilmoqda',
             timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-        )''',
-        commit=True
+        )'''
     )
 
-    card = await asyncio.to_thread(db_query, "SELECT value FROM settings WHERE key = 'card_number'", fetchone=True)
+    card = await db_fetch("SELECT value FROM settings WHERE key = 'card_number'", fetchone=True)
     if not card:
-        await asyncio.to_thread(db_query, "INSERT INTO settings (key, value) VALUES ('card_number', 'Kiritilmagan')", commit=True)
+        await db_execute("INSERT INTO settings (key, value) VALUES ('card_number', 'Kiritilmagan')")
     
-    mode = await asyncio.to_thread(db_query, "SELECT value FROM settings WHERE key = 'crash_mode'", fetchone=True)
+    mode = await db_fetch("SELECT value FROM settings WHERE key = 'crash_mode'", fetchone=True)
     if not mode:
-        await asyncio.to_thread(db_query, "INSERT INTO settings (key, value) VALUES ('crash_mode', 'admin')", commit=True)
+        await db_execute("INSERT INTO settings (key, value) VALUES ('crash_mode', 'admin')")
 
-    mult = await asyncio.to_thread(db_query, "SELECT value FROM settings WHERE key = 'admin_multiplier'", fetchone=True)
+    mult = await db_fetch("SELECT value FROM settings WHERE key = 'admin_multiplier'", fetchone=True)
     if not mult:
-        await asyncio.to_thread(db_query, "INSERT INTO settings (key, value) VALUES ('admin_multiplier', '2.00')", commit=True)
+        await db_execute("INSERT INTO settings (key, value) VALUES ('admin_multiplier', '2.00')")
 
-    streak = await asyncio.to_thread(db_query, "SELECT value FROM settings WHERE key = 'admin_streak'", fetchone=True)
+    streak = await db_fetch("SELECT value FROM settings WHERE key = 'admin_streak'", fetchone=True)
     if not streak:
-        await asyncio.to_thread(db_query, "INSERT INTO settings (key, value) VALUES ('admin_streak', '0')", commit=True)
+        await db_execute("INSERT INTO settings (key, value) VALUES ('admin_streak', '0')")
 
 async def get_setting(key: str) -> str:
-    row = await asyncio.to_thread(db_query, "SELECT value FROM settings WHERE key = ?", (key,), fetchone=True)
+    row = await db_fetch("SELECT value FROM settings WHERE key = ?", (key,), fetchone=True)
     return row[0] if row else ""
 
 async def update_setting(key: str, value: str):
-    await asyncio.to_thread(db_query, "UPDATE settings SET value = ? WHERE key = ?", (str(value), key), commit=True)
+    await db_execute("UPDATE settings SET value = ? WHERE key = ?", (str(value), key))
 
 async def get_card_number() -> str:
     return await get_setting("card_number")
@@ -128,34 +115,34 @@ async def set_card_number(card: str):
     await update_setting("card_number", card)
 
 async def get_balance(user_id: int, username: str = None) -> int:
-    row = await asyncio.to_thread(db_query, "SELECT balance FROM users WHERE user_id = ?", (user_id,), fetchone=True)
+    row = await db_fetch("SELECT balance FROM users WHERE user_id = ?", (user_id,), fetchone=True)
     if row:
         return row[0]
     else:
         uname = username or "Noma'lum"
-        await asyncio.to_thread(db_query, "INSERT INTO users (user_id, username, balance, has_deposited) VALUES (?, ?, 0, 0)", (user_id, uname), commit=True)
+        await db_execute("INSERT INTO users (user_id, username, balance, has_deposited) VALUES (?, ?, 0, 0)", (user_id, uname))
         return 0
 
 async def change_balance(user_id: int, amount: int):
     await get_balance(user_id)
-    await asyncio.to_thread(db_query, "UPDATE users SET balance = balance + ? WHERE user_id = ?", (amount, user_id), commit=True)
+    await db_execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (amount, user_id))
 
 async def check_user_deposited(user_id: int) -> bool:
-    row = await asyncio.to_thread(db_query, "SELECT has_deposited FROM users WHERE user_id = ?", (user_id,), fetchone=True)
+    row = await db_fetch("SELECT has_deposited FROM users WHERE user_id = ?", (user_id,), fetchone=True)
     return row and row[0] == 1
 
 async def set_user_deposited(user_id: int):
-    await asyncio.to_thread(db_query, "UPDATE users SET has_deposited = 1 WHERE user_id = ?", (user_id,), commit=True)
+    await db_execute("UPDATE users SET has_deposited = 1 WHERE user_id = ?", (user_id,))
 
 async def get_last_claim(user_id: int) -> int:
-    row = await asyncio.to_thread(db_query, "SELECT last_claim FROM mining WHERE user_id = ?", (user_id,), fetchone=True)
+    row = await db_fetch("SELECT last_claim FROM mining WHERE user_id = ?", (user_id,), fetchone=True)
     return row[0] if row else 0
 
 async def update_last_claim(user_id: int, timestamp: int):
-    await asyncio.to_thread(db_query, "INSERT OR REPLACE INTO mining (user_id, last_claim) VALUES (?, ?)", (user_id, timestamp), commit=True)
+    await db_execute("INSERT OR REPLACE INTO mining (user_id, last_claim) VALUES (?, ?)", (user_id, timestamp))
 
 async def get_users_count() -> int:
-    row = await asyncio.to_thread(db_query, "SELECT COUNT(*) FROM users", fetchone=True)
+    row = await db_fetch("SELECT COUNT(*) FROM users", fetchone=True)
     return row[0] if row else 0
 
 fn = lambda val: f"{val:,}".replace(",", " ")
@@ -322,7 +309,7 @@ async def claim_mining_handler(callback: CallbackQuery):
     )
 
 # =========================================================
-# 📥 DEPOZIT VA 📤 PUL CHIQARish TIZIMLARI
+# 📥 DEPOZIT VA 📤 PUL CHIQARISH TIZIMLARI
 # =========================================================
 @dp.callback_query(F.data == "deposit_money")
 async def deposit_start(callback: CallbackQuery, state: FSMContext):
@@ -525,14 +512,14 @@ async def admin_users_callback(callback: CallbackQuery):
 @dp.callback_query(F.data == "admin_stats")
 async def admin_stats_callback(callback: CallbackQuery):
     if callback.from_user.id != ADMIN_ID: return
-    row = await asyncio.to_thread(db_query, "SELECT COUNT(*), SUM(balance) FROM users", fetchone=True)
-    games = await asyncio.to_thread(db_query, "SELECT COUNT(*) FROM crash_history", fetchone=True)
+    row = await db_fetch("SELECT COUNT(*), SUM(balance) FROM users", fetchone=True)
+    games = await db_fetch("SELECT COUNT(*) FROM crash_history", fetchone=True)
     await callback.answer(f"Foydalanuvchilar: {row[0]}\nUmumiy balans: {fn(row[1] or 0)} coin\nO'yinlar soni: {games[0]}", show_alert=True)
 
 @dp.callback_query(F.data == "admin_history")
 async def admin_history_callback(callback: CallbackQuery):
     if callback.from_user.id != ADMIN_ID: return
-    rows = await asyncio.to_thread(db_query, "SELECT multiplier, mode, timestamp FROM crash_history ORDER BY id DESC LIMIT 10", fetchall=True)
+    rows = await db_fetch("SELECT multiplier, mode, timestamp FROM crash_history ORDER BY id DESC LIMIT 10")
     text = "🎮 <b>Oxirgi 10 ta Crash o'yini:</b>\n\n"
     for r in rows:
         text += f"• X: <b>{r[0]}x</b> | Rejim: {r[1]} | {r[2]}\n"
@@ -540,56 +527,27 @@ async def admin_history_callback(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "set_card")
 async def set_card_prompt(callback: CallbackQuery, state: FSMContext):
-    if callback.from_user.id != ADMIN_ID: 
-        return
+    if callback.from_user.id != ADMIN_ID: return
     await state.set_state(AdminState.waiting_card_number)
     await callback.message.edit_text(
-        "💳 <b>Yangi karta raqami yoki rekvizitni kiriting:</b>\n(Masalan: 8600 0000 0000 0000 — Ism Familiya)",
+        "💳 <b>Yangi karta raqami yoki rekvizitni kiriting:</b>",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Bekor qilish", callback_data="admin_panel")]]),
         parse_mode=ParseMode.HTML
     )
 
 @dp.message(AdminState.waiting_card_number)
 async def process_set_card(message: Message, state: FSMContext):
-    if message.from_user.id != ADMIN_ID: 
-        return
+    if message.from_user.id != ADMIN_ID: return
     new_card = message.text.strip()
     await set_card_number(new_card)
     await state.clear()
-    
-    card_num = await get_card_number()
-    users_count = await get_users_count()
-    cur_x = await get_setting("admin_multiplier")
-    mode = await get_setting("crash_mode")
-    
-    await message.answer(
-        f"✅ <b>Karta raqami muvaffaqiyatli yangilandi!</b>\n\n"
-        f"👨‍💼 <b>ADMIN PANEL</b>\n"
-        f"──────────────────────────\n"
-        f"👥 Jami foydalanuvchilar: <b>{users_count} ta</b>\n"
-        f"🎯 Hozirgi Crash Rejim: <b>{mode.upper()}</b>\n"
-        f"⚙️ Admin X qiymati: <b>{cur_x}x</b>\n"
-        f"💳 Yangi karta: <code>{card_num}</code>\n"
-        f"──────────────────────────",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="👥 Foydalanuvchilar ro'yxati", callback_data="admin_users")],
-            [InlineKeyboardButton(text="📊 Statistika", callback_data="admin_stats")],
-            [InlineKeyboardButton(text="🎮 Crash O'yinlar tarixi", callback_data="admin_history")],
-            [InlineKeyboardButton(text="⚙️ Crash X ni o'zgartirish", callback_data="set_crash_x")],
-            [InlineKeyboardButton(text="💳 Kartani o'zgartirish", callback_data="set_card")],
-            [InlineKeyboardButton(text="➕ Coin berish", callback_data="admin_add_coin")],
-            [InlineKeyboardButton(text="➖ Coin ayirish", callback_data="admin_sub_coin")],
-            [InlineKeyboardButton(text="📢 Xabar yuborish", callback_data="admin_broadcast")],
-            [InlineKeyboardButton(text="🏠 Asosiy menyu", callback_data="back_to_menu")]
-        ]),
-        parse_mode=ParseMode.HTML
-    )
+    await message.answer("✅ Karta raqami muvaffaqiyatli yangilandi!", reply_markup=main_menu(message.from_user.id))
 
 @dp.callback_query(F.data == "set_crash_x")
 async def set_crash_x_prompt(callback: CallbackQuery, state: FSMContext):
     if callback.from_user.id != ADMIN_ID: return
     await state.set_state(AdminState.waiting_crash_x)
-    await callback.message.edit_text("⚙️ Admin X qiymatini kiriting (masalan: 2.50):", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Bekor", callback_data="admin_panel")]]))
+    await callback.message.edit_text("⚙️ Admin X qiymatini kiriting (masalan: 1.50):", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Bekor", callback_data="admin_panel")]]))
 
 @dp.message(AdminState.waiting_crash_x)
 async def process_set_crash_x(message: Message, state: FSMContext):
@@ -597,9 +555,9 @@ async def process_set_crash_x(message: Message, state: FSMContext):
     try:
         val = float(message.text.replace(",", "."))
         await update_setting("admin_multiplier", str(val))
-        await update_setting("crash_mode", "admin") # Admin kiritganda rejim admin bo'ladi
+        await update_setting("crash_mode", "admin")
         await state.clear()
-        await message.answer(f"✅ Admin X {val}x ga o'zgartirildi va rejim o'rnatildi!", reply_markup=main_menu(message.from_user.id))
+        await message.answer(f"✅ Admin X {val}x ga o'zgartirildi!", reply_markup=main_menu(message.from_user.id))
     except ValueError:
         await message.answer("❌ Faqat raqam kiriting:")
 
@@ -655,19 +613,19 @@ async def admin_send_broadcast(message: Message, state: FSMContext):
     if message.from_user.id != ADMIN_ID: return
     text = message.text
     await state.clear()
-    users = await asyncio.to_thread(db_query, "SELECT user_id FROM users", fetchall=True)
+    users = await db_fetch("SELECT user_id FROM users")
     success = 0
     for u in users:
         try:
             await bot.send_message(u[0], text, parse_mode=ParseMode.HTML)
             success += 1
-            await asyncio.sleep(0.05)
+            await asyncio.sleep(0.02)
         except Exception:
             pass
     await message.answer(f"✅ Xabar {success} ta foydalanuvchiga muvaffaqiyatli yuborildi!")
 
 # =========================================================
-# 🚀 CRASH AVTOMATIK FONI VA TESKARI SANOQ MANTIQI
+# 🚀 CRASH AVTOMATIK DVIGATELI (8 SEKUNDLIK TESKARI SANOQ)
 # =========================================================
 async def start_crash_engine():
     global BETTING_OPEN, CURRENT_ROUND_ID
@@ -675,41 +633,38 @@ async def start_crash_engine():
         try:
             CURRENT_ROUND_ID += 1
             
-            # 8 soniya teskari sanoq va stavka qabul qilish boshlanadi
+            # 1. 8 soniya teskari sanoq va stavka qabul qilish ochiq
             BETTING_OPEN = True
-            for remaining in range(8, 0, -1):
-                # Bu yerda istasangiz barcha foydalanuvchilarga vaqtni yuborishingiz yoki statusni saqlashingiz mumkin
-                await asyncio.sleep(1)
+            await asyncio.sleep(8)
             
-            # Stavka qabul qilish yopiladi
+            # 2. Stavka qabul qilish yopiladi
             BETTING_OPEN = False
 
             mode = await get_setting("crash_mode")
             admin_x = float(await get_setting("admin_multiplier") or 2.0)
             streak = int(await get_setting("admin_streak") or 0)
             
-            crash_at = 2.00
+            crash_at = 1.50
             used_mode = ""
 
-            # Shart: Agar admin x bergan bo'lsa o'sha ishlaydi, bermasa Random (1.00 dan 1.90 gacha)
+            # Agar admin x bergan bo'lsa o'sha ishlaydi, bermasa 1.00 - 1.90 oralig'ida random
             if mode == "admin":
                 crash_at = admin_x
                 used_mode = "Admin X"
                 streak += 1
                 await update_setting("admin_streak", str(streak))
                 
-                # 1 marta ishlatilgach random rejimga o'tishi uchun (yoki admin o'zgartirguncha)
                 if streak >= 1:
                     await update_setting("crash_mode", "random")
                     await update_setting("admin_streak", "0")
             else:
-                # Random 1.00 dan 1.90 gacha (1.00 da ham uchib turishi mumkin)
+                # 1.00 dan 1.90 gacha random (1.00 da ham darhol portlashi mumkin)
                 crash_at = round(random.uniform(1.00, 1.90), 2)
                 used_mode = "Random X"
 
-            await asyncio.to_thread(db_query, "INSERT INTO crash_history (multiplier, mode) VALUES (?, ?)", (crash_at, used_mode), commit=True)
+            await db_execute("INSERT INTO crash_history (multiplier, mode) VALUES (?, ?)", (crash_at, used_mode))
             
-            # O'yin parvozi tugaguncha kutamiz (masalan, parvoz vaqti)
+            # O'yin parvozi vaqti (taxminan 5-6 sekund davom etadi)
             await asyncio.sleep(6)
             
         except Exception as e:
@@ -717,13 +672,13 @@ async def start_crash_engine():
             await asyncio.sleep(3)
 
 # =========================================================
-# 🚀 CRASH O'YINI MANTIQLARI VA PARVOZ
+# 🚀 CRASH O'YINI VA STAVKA QILISH
 # =========================================================
 @dp.callback_query(F.data == "play_crash")
 async def play_crash_menu(callback: CallbackQuery, state: FSMContext):
     global BETTING_OPEN
     if not BETTING_OPEN:
-        await callback.answer("⏳ Hozir stavka qabul qilish vaqti tugagan! O'yin tugagandan keyin stavka qilishingiz mumkin.", show_alert=True)
+        await callback.answer("⚠️ Hozir stavka vaqti tugagan! O'yin tugagandan keyin stavka qilishingiz mumkin.", show_alert=True)
         return
 
     await state.set_state(CrashState.waiting_bet)
@@ -742,7 +697,7 @@ async def play_crash_menu(callback: CallbackQuery, state: FSMContext):
 async def process_crash_bet(message: Message, state: FSMContext):
     global BETTING_OPEN
     if not BETTING_OPEN:
-        await message.answer("❌ Kechikdingiz! Stavka qabul qilish vaqti tugadi. O'yin tugagandan keyin qayta urinib ko'ring.", reply_markup=main_menu(message.from_user.id))
+        await message.answer("❌ Kechikdingiz! Stavka qabul qilish vaqti tugadi. O'yin tugagandan keyin stavka qilishingiz mumkin.", reply_markup=main_menu(message.from_user.id))
         await state.clear()
         return
 
@@ -767,24 +722,16 @@ async def process_crash_bet(message: Message, state: FSMContext):
     await state.clear()
 
     # So'nggi crash natijasini olib kelamiz
-    last_row = await asyncio.to_thread(
-        db_query, 
-        "SELECT multiplier FROM crash_history ORDER BY id DESC LIMIT 1", 
-        fetchone=True
-    )
+    last_row = await db_fetch("SELECT multiplier FROM crash_history ORDER BY id DESC LIMIT 1", fetchone=True)
     crash_target = last_row[0] if last_row else 1.50
 
-    # O'yin holati
     current_multiplier = 1.00
-    is_cashed_out = False
-
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="💰 Pulni olish", callback_data="cash_out")]
         ]
     )
 
-    # O'yin seansini saqlaymiz
     ACTIVE_GAMES[user_id] = {
         "bet": bet_amount,
         "multiplier": current_multiplier,
@@ -804,7 +751,7 @@ async def process_crash_bet(message: Message, state: FSMContext):
 
     # Parvoz tsikli
     while current_multiplier < crash_target:
-        await asyncio.sleep(0.6)
+        await asyncio.sleep(0.5)
         
         if user_id not in ACTIVE_GAMES:
             break
@@ -812,7 +759,6 @@ async def process_crash_bet(message: Message, state: FSMContext):
         if ACTIVE_GAMES[user_id]["cashed"]:
             break
 
-        # Multiplierni oshiramiz
         increment = round(random.uniform(0.02, 0.08), 2)
         current_multiplier = round(current_multiplier + increment, 2)
         
@@ -835,7 +781,6 @@ async def process_crash_bet(message: Message, state: FSMContext):
         except Exception:
             pass
 
-    # Crash sodir bo'ldi yoki o'yin yakunlandi
     game_data = ACTIVE_GAMES.get(user_id)
     if game_data and not game_data["cashed"]:
         ACTIVE_GAMES.pop(user_id, None)
@@ -846,7 +791,7 @@ async def process_crash_bet(message: Message, state: FSMContext):
                 text=f"💥 <b>CRASH! RAKETA PORTLADI!</b>\n\n"
                 f"📉 To'xtagan nuqta: <b>{crash_target:.2f}x</b>\n"
                 f"❌ Afsuski, stavkangiz yondi: <b>{fn(bet_amount)} coin</b>\n\n"
-                f"ℹ️ <i>O'yin tugadi. Endi yangi raundda stavka qilishingiz mumkin!</i>",
+                f"ℹ️ <i>O'yin tugadi. Endi stavka qilishingiz mumkin!</i>",
                 reply_markup=InlineKeyboardMarkup(
                     inline_keyboard=[
                         [InlineKeyboardButton(text="🔄 Qaytadan o'ynash", callback_data="play_crash")],
@@ -883,7 +828,7 @@ async def cash_out_handler(callback: CallbackQuery):
             f"✅ <b>MUVAFFAQIYATLI YECHIB OLINDI!</b>\n\n"
             f"📈 Multiplier: <b>{multiplier:.2f}x</b>\n"
             f"💰 Yutuq: <b>+{fn(winnings)} coin</b>\n\n"
-            f"ℹ️ <i>O'yin tugadi. Endi yangi raundda stavka qilishingiz mumkin!</i>",
+            f"ℹ️ <i>O'yin tugadi. Endi stavka qilishingiz mumkin!</i>",
             reply_markup=InlineKeyboardMarkup(
                 inline_keyboard=[
                     [InlineKeyboardButton(text="🚀 Yana o'ynash", callback_data="play_crash")],
@@ -907,7 +852,7 @@ async def main():
     # Crash avtomatik dvigatelini fonda ishga tushiramiz
     asyncio.create_task(start_crash_engine())
     
-    print("Bot muvaffaqiyatli ishga tushdi!")
+    print("Bot 1000+ foydalanuvchilar uchun muvaffaqiyatli ishga tushdi!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":

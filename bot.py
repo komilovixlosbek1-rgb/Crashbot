@@ -857,3 +857,39 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+from aiohttp import web
+
+# Web server (Render uxlab qolmasligi uchun)
+async def handle(request):
+    return web.Response(text="Bot is running!")
+
+async def web_server():
+    app = web.Application()
+    app.router.add_get("/", handle)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    
+    # Render beradigan PORT ni avtomatik oladi, bo'lmasa 8080 ishlatadi
+    port = int(os.environ.get("PORT", 8080))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+
+# =========================================================
+# BOTNI ISHGA TUSHIRISH
+# =========================================================
+async def main():
+    logging.basicConfig(level=logging.INFO)
+    await init_db()
+    
+    # Crash avtomatik dvigatelini fonda ishga tushiramiz
+    asyncio.create_task(start_crash_engine())
+    
+    # Web serverni fonda ishga tushiramiz (Render uchun)
+    asyncio.create_task(web_server())
+    
+    print("Bot va Web-server 1000+ foydalanuvchilar uchun muvaffaqiyatli ishga tushdi!")
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    import os
+    asyncio.run(main())
